@@ -918,12 +918,14 @@ std::wstring CleanRegistry()
                 // Delete all values under Count
                 std::vector<std::wstring> countValues;
                 DWORD idx = 0;
+                wchar_t cvName[512];
+                DWORD cvNameLen;
                 while (true)
                 {
-                    valueNameLen = 512;
-                    if (RegEnumValue(hCountKey, idx, valueName, &valueNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                    cvNameLen = 512;
+                    if (RegEnumValue(hCountKey, idx, cvName, &cvNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
                         break;
-                    countValues.push_back(valueName);
+                    countValues.push_back(cvName);
                     idx++;
                 }
                 for (auto& cv : countValues)
