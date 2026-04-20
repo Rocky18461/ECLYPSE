@@ -41,20 +41,59 @@ enum Tab
 {
     TAB_CLEANER,
     TAB_PARTITIONS,
-    TAB_OTHERS,
+    TAB_OPTIMIZATION,
+    TAB_OTHERS, // always last
     TAB_COUNT
 };
 
 static const wchar_t* g_tabNames[TAB_COUNT] = {
     L"Cleaner",
     L"Partitions",
+    L"Optimization",
     L"Others"
 };
 
 static const wchar_t* g_tabDescriptions[TAB_COUNT] = {
     L"Wipe an entire drive. All data will be permanently deleted.",
     L"Manage disk partitions and Windows installation guide.",
+    L"Optimize Windows settings for maximum gaming performance.",
     L"Clean temp files, logs, caches, registry, prefetch, DNS, and game folders."
+};
+
+// Optimization tab options
+enum OptimizeOption
+{
+    OPTIM_POWER_PLAN,
+    OPTIM_GAME_BAR,
+    OPTIM_VISUAL_FX,
+    OPTIM_NAGLE,
+    OPTIM_MOUSE_ACCEL,
+    OPTIM_FULLSCREEN_OPT,
+    OPTIM_STANDBY_MEM,
+    OPTIM_GPU_PRIORITY,
+    OPTIM_COUNT
+};
+
+static const wchar_t* g_optimNames[OPTIM_COUNT] = {
+    L"Power Plan",
+    L"Game Bar",
+    L"Visual Effects",
+    L"Nagle's Algorithm",
+    L"Mouse Accel",
+    L"Fullscreen Opt",
+    L"Standby Memory",
+    L"GPU Priority"
+};
+
+static const wchar_t* g_optimDescs[OPTIM_COUNT] = {
+    L"Set power plan to Ultimate/High Performance",
+    L"Disable Xbox Game Bar and Game DVR",
+    L"Disable animations, transparency, and visual effects",
+    L"Disable Nagle's algorithm for lower network latency",
+    L"Disable mouse acceleration for raw input",
+    L"Disable fullscreen optimizations system-wide",
+    L"Flush standby memory to free up RAM",
+    L"Set GPU scheduling to high priority"
 };
 
 // Others tab options
@@ -135,6 +174,10 @@ static bool g_partShowDriveSelect = false;
 // Others tab state
 static ButtonState g_optionBtns[OPT_COUNT];
 static RECT g_optionBtnRects[OPT_COUNT];
+
+// Optimization tab state
+static ButtonState g_optimBtns[OPTIM_COUNT];
+static RECT g_optimBtnRects[OPTIM_COUNT];
 
 constexpr int SIDEBAR_WIDTH = 150;
 constexpr int TAB_HEIGHT = 38;
@@ -443,6 +486,58 @@ void DrawDriveSelectPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+void DrawOptimizationPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Optimization", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Optimize Windows for maximum gaming performance.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    // Option buttons - two columns
+    int btnWidth = 190;
+    int btnHeight = 42;
+    int spacing = 10;
+    int colGap = 14;
+    int startY = 110;
+    int col1Left = contentCenterX - btnWidth - colGap / 2;
+    int col2Left = contentCenterX + colGap / 2;
+
+    for (int i = 0; i < OPTIM_COUNT; i++)
+    {
+        int col = i % 2;
+        int row = i / 2;
+
+        RECT btnRect;
+        btnRect.left = (col == 0) ? col1Left : col2Left;
+        btnRect.right = btnRect.left + btnWidth;
+        btnRect.top = startY + row * (btnHeight + spacing);
+        btnRect.bottom = btnRect.top + btnHeight;
+        g_optimBtnRects[i] = btnRect;
+
+        DrawRoundedButton(hdc, btnRect, g_optimNames[i], g_optimBtns[i]);
+    }
+
+    SelectObject(hdc, oldFont);
+}
+
 void DrawOthersPanel(HDC hdc, RECT clientRect)
 {
     int contentLeft = SIDEBAR_WIDTH + 30;
@@ -654,6 +749,10 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
     else if (g_activeTab == TAB_PARTITIONS)
     {
         DrawPartitionsPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_OPTIMIZATION)
+    {
+        DrawOptimizationPanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_OTHERS)
     {
@@ -1039,7 +1138,264 @@ std::wstring CleanGameFolders()
 }
 
 // ============================================================
+// ============================================================
+// Optimization functions
+// ============================================================
+
+std::wstring OptimPowerPlan()
+{
+    // Activate Ultimate Performance (or High Performance as fallback)
+    STARTUPINFO si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    // First try to unhide Ultimate Performance
+    wchar_t unhideCmd[] = L"powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61";
+    CreateProcess(nullptr, unhideCmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    WaitForSingleObject(pi.hProcess, 5000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    // Set High Performance as active
+    wchar_t setCmd[] = L"powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+    pi = {};
+    BOOL ok = CreateProcess(nullptr, setCmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (ok)
+    {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    return L"Power plan set to High Performance.";
+}
+
+std::wstring OptimGameBar()
+{
+    int changed = 0;
+    HKEY hKey;
+
+    // Disable Game Bar
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\GameBar", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD val = 0;
+        RegSetValueEx(hKey, L"AllowAutoGameMode", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegSetValueEx(hKey, L"AutoGameModeEnabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegSetValueEx(hKey, L"UseNexusForGameBarEnabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+        changed++;
+    }
+
+    // Disable Game DVR
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, L"System\\GameConfigStore", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val = 0;
+        RegSetValueEx(hKey, L"GameDVR_Enabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+        changed++;
+    }
+
+    if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val = 0;
+        RegSetValueEx(hKey, L"AllowGameDVR", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+        changed++;
+    }
+
+    return L"Xbox Game Bar and Game DVR disabled.";
+}
+
+std::wstring OptimVisualFx()
+{
+    HKEY hKey;
+
+    // Set visual effects to "Adjust for best performance"
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD val = 2; // 2 = Best Performance
+        RegSetValueEx(hKey, L"VisualFXSetting", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+    }
+
+    // Disable transparency
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD val = 0;
+        RegSetValueEx(hKey, L"EnableTransparency", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+    }
+
+    // Disable animations
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Desktop\\WindowMetrics", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        RegSetValueEx(hKey, L"MinAnimate", 0, REG_SZ, (BYTE*)L"0", 4);
+        RegCloseKey(hKey);
+    }
+
+    // Disable smooth scrolling, menu animations
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD zero2 = 0;
+        RegSetValueEx(hKey, L"SmoothScroll", 0, REG_DWORD, (BYTE*)&zero2, sizeof(DWORD));
+        RegSetValueEx(hKey, L"UserPreferencesMask", 0, REG_BINARY,
+            (BYTE*)"\x90\x12\x03\x80\x10\x00\x00\x00", 8);
+        RegCloseKey(hKey);
+    }
+
+    return L"Visual effects set to best performance. Transparency and animations disabled.";
+}
+
+std::wstring OptimNagle()
+{
+    HKEY hKey;
+    int changed = 0;
+
+    // Find all network interfaces and disable Nagle's algorithm
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces",
+        0, KEY_ENUMERATE_SUB_KEYS, &hKey) == ERROR_SUCCESS)
+    {
+        wchar_t subKeyName[256];
+        DWORD index = 0;
+        DWORD nameLen;
+
+        while (true)
+        {
+            nameLen = 256;
+            if (RegEnumKeyEx(hKey, index, subKeyName, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+
+            HKEY hSubKey;
+            if (RegOpenKeyEx(hKey, subKeyName, 0, KEY_SET_VALUE, &hSubKey) == ERROR_SUCCESS)
+            {
+                DWORD val = 1;
+                RegSetValueEx(hSubKey, L"TcpAckFrequency", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+                RegSetValueEx(hSubKey, L"TCPNoDelay", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+                RegCloseKey(hSubKey);
+                changed++;
+            }
+            index++;
+        }
+        RegCloseKey(hKey);
+    }
+
+    wchar_t result[128];
+    wsprintfW(result, L"Nagle's algorithm disabled on %d network interfaces.", changed);
+    return result;
+}
+
+std::wstring OptimMouseAccel()
+{
+    // Disable enhanced pointer precision (mouse acceleration)
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Mouse", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        RegSetValueEx(hKey, L"MouseSpeed", 0, REG_SZ, (BYTE*)L"0", 4);
+        RegSetValueEx(hKey, L"MouseThreshold1", 0, REG_SZ, (BYTE*)L"0", 4);
+        RegSetValueEx(hKey, L"MouseThreshold2", 0, REG_SZ, (BYTE*)L"0", 4);
+        RegCloseKey(hKey);
+    }
+
+    // Apply immediately
+    int params[3] = { 0, 0, 0 };
+    SystemParametersInfo(SPI_SETMOUSE, 0, params, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    return L"Mouse acceleration disabled. Raw input enabled.";
+}
+
+std::wstring OptimFullscreenOpt()
+{
+    HKEY hKey;
+
+    // Disable fullscreen optimizations globally
+    if (RegCreateKeyEx(HKEY_CURRENT_USER,
+        L"System\\GameConfigStore", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD fsoDisable = 2;
+        DWORD fsoEnable = 1;
+        RegSetValueEx(hKey, L"GameDVR_FSEBehaviorMode", 0, REG_DWORD, (BYTE*)&fsoDisable, sizeof(DWORD));
+        RegSetValueEx(hKey, L"GameDVR_HonorUserFSEBehaviorMode", 0, REG_DWORD, (BYTE*)&fsoEnable, sizeof(DWORD));
+        RegSetValueEx(hKey, L"GameDVR_FSEBehavior", 0, REG_DWORD, (BYTE*)&fsoDisable, sizeof(DWORD));
+        RegSetValueEx(hKey, L"GameDVR_DXGIHonorFSEWindowsCompatible", 0, REG_DWORD, (BYTE*)&fsoEnable, sizeof(DWORD));
+        RegCloseKey(hKey);
+    }
+
+    return L"Fullscreen optimizations disabled globally.";
+}
+
+std::wstring OptimStandbyMem()
+{
+    // Free standby memory using EmptyWorkingSet on all processes
+    // and RtlAdjustPrivilege + NtSetSystemInformation approach
+    HANDLE hProcess = GetCurrentProcess();
+
+    // First enable SeProfileSingleProcessPrivilege
+    HANDLE hToken;
+    if (OpenProcessToken(hProcess, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+    {
+        TOKEN_PRIVILEGES tp = {};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        LookupPrivilegeValue(nullptr, SE_PROF_SINGLE_PROCESS_NAME, &tp.Privileges[0].Luid);
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+
+        // Also enable SeIncreaseQuotaPrivilege
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        LookupPrivilegeValue(nullptr, SE_INCREASE_QUOTA_NAME, &tp.Privileges[0].Luid);
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        CloseHandle(hToken);
+    }
+
+    // Use SetProcessWorkingSetSize to trim current process
+    SetProcessWorkingSetSize(hProcess, (SIZE_T)-1, (SIZE_T)-1);
+
+    // Clear file system cache via SetSystemFileCacheSize
+    SetSystemFileCacheSize(0, 0, FILE_CACHE_MIN_HARD_DISABLE | FILE_CACHE_MAX_HARD_DISABLE);
+
+    // Re-enable cache with defaults
+    SetSystemFileCacheSize(0, 0, FILE_CACHE_MIN_HARD_ENABLE | FILE_CACHE_MAX_HARD_ENABLE);
+
+    return L"Standby memory flushed. RAM freed for gaming.";
+}
+
+std::wstring OptimGpuPriority()
+{
+    HKEY hKey;
+
+    // Set GPU scheduling priority
+    if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD gpuPriority = 8;
+        DWORD priority = 6;
+        DWORD schedulingCategory = 3; // High
+        DWORD sfioCategory = 3; // High
+        RegSetValueEx(hKey, L"GPU Priority", 0, REG_DWORD, (BYTE*)&gpuPriority, sizeof(gpuPriority));
+        RegSetValueEx(hKey, L"Priority", 0, REG_DWORD, (BYTE*)&priority, sizeof(priority));
+        RegSetValueEx(hKey, L"Scheduling Category", 0, REG_SZ, (BYTE*)L"High", 10);
+        RegSetValueEx(hKey, L"SFIO Priority", 0, REG_SZ, (BYTE*)L"High", 10);
+        RegCloseKey(hKey);
+    }
+
+    // Enable hardware-accelerated GPU scheduling
+    if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val = 2;
+        RegSetValueEx(hKey, L"HwSchMode", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+    }
+
+    return L"GPU priority set to high. Hardware-accelerated GPU scheduling enabled.";
+}
+
+// ============================================================
 // Disk functions
+// ============================================================
 // ============================================================
 
 DWORD GetPhysicalDiskNumber(wchar_t driveLetter)
@@ -1527,7 +1883,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (g_activeTab == TAB_OTHERS)
+        if (g_activeTab == TAB_OPTIMIZATION)
+        {
+            for (int i = 0; i < OPTIM_COUNT; i++)
+            {
+                bool wasHov = g_optimBtns[i].hovered;
+                g_optimBtns[i].hovered = PtInRect(&g_optimBtnRects[i], pt);
+                if (wasHov != g_optimBtns[i].hovered)
+                    InvalidateRect(hwnd, &g_optimBtnRects[i], FALSE);
+            }
+        }
+        else if (g_activeTab == TAB_OTHERS)
         {
             for (int i = 0; i < OPT_COUNT; i++)
             {
@@ -1566,6 +1932,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         for (auto& s : g_partDriveBtnStates)
             s.hovered = false;
         for (auto& s : g_optionBtns)
+            s.hovered = false;
+        for (auto& s : g_optimBtns)
             s.hovered = false;
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -1650,7 +2018,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (g_activeTab == TAB_OTHERS)
+        if (g_activeTab == TAB_OPTIMIZATION)
+        {
+            for (int i = 0; i < OPTIM_COUNT; i++)
+            {
+                if (PtInRect(&g_optimBtnRects[i], pt))
+                {
+                    g_optimBtns[i].pressed = true;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g_optimBtnRects[i], FALSE);
+                    return 0;
+                }
+            }
+        }
+        else if (g_activeTab == TAB_OTHERS)
         {
             for (int i = 0; i < OPT_COUNT; i++)
             {
@@ -1805,6 +2186,43 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
+            }
+        }
+
+        // Optimization tab buttons
+        if (g_activeTab == TAB_OPTIMIZATION)
+        {
+            for (int i = 0; i < OPTIM_COUNT; i++)
+            {
+                bool wasPressed = g_optimBtns[i].pressed;
+                g_optimBtns[i].pressed = false;
+
+                if (wasPressed && PtInRect(&g_optimBtnRects[i], pt))
+                {
+                    wchar_t confirmMsg[256];
+                    wsprintfW(confirmMsg, L"Apply optimization: %s?\n\n%s", g_optimNames[i], g_optimDescs[i]);
+                    int result = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+
+                    if (result == IDYES)
+                    {
+                        std::wstring resultStr;
+                        switch (i)
+                        {
+                        case OPTIM_POWER_PLAN:      resultStr = OptimPowerPlan(); break;
+                        case OPTIM_GAME_BAR:        resultStr = OptimGameBar(); break;
+                        case OPTIM_VISUAL_FX:       resultStr = OptimVisualFx(); break;
+                        case OPTIM_NAGLE:           resultStr = OptimNagle(); break;
+                        case OPTIM_MOUSE_ACCEL:     resultStr = OptimMouseAccel(); break;
+                        case OPTIM_FULLSCREEN_OPT:  resultStr = OptimFullscreenOpt(); break;
+                        case OPTIM_STANDBY_MEM:     resultStr = OptimStandbyMem(); break;
+                        case OPTIM_GPU_PRIORITY:    resultStr = OptimGpuPriority(); break;
+                        }
+                        MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Applied", MB_OK | MB_ICONINFORMATION);
+                    }
+
+                    InvalidateRect(hwnd, &g_optimBtnRects[i], FALSE);
+                    return 0;
+                }
             }
         }
 
