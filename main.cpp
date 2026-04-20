@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <dwmapi.h>
 #include <winioctl.h>
+#include <ShlObj.h>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -8,6 +9,7 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 // ECLYPSE color palette
 namespace Colors
@@ -658,6 +660,385 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
         DrawOthersPanel(hdc, clientRect);
     }
 }
+
+// ============================================================
+// Cleaning functions
+// ============================================================
+
+int DeleteFilesInFolder(const wchar_t* folderPath, const wchar_t* pattern, bool recurse)
+{
+    int deleted = 0;
+    wchar_t searchPath[MAX_PATH];
+    wsprintfW(searchPath, L"%s\\%s", folderPath, pattern);
+
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile(searchPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return 0;
+
+    do
+    {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        wchar_t fullPath[MAX_PATH];
+        wsprintfW(fullPath, L"%s\\%s", folderPath, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            if (recurse)
+            {
+                deleted += DeleteFilesInFolder(fullPath, pattern, true);
+                RemoveDirectory(fullPath);
+            }
+        }
+        else
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+                SetFileAttributes(fullPath, fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+            if (DeleteFile(fullPath))
+                deleted++;
+        }
+    } while (FindNextFile(hFind, &fd));
+
+    FindClose(hFind);
+    return deleted;
+}
+
+int DeleteFolderContents(const wchar_t* folderPath)
+{
+    int deleted = 0;
+    wchar_t searchPath[MAX_PATH];
+    wsprintfW(searchPath, L"%s\\*", folderPath);
+
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile(searchPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return 0;
+
+    do
+    {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        wchar_t fullPath[MAX_PATH];
+        wsprintfW(fullPath, L"%s\\%s", folderPath, fd.cFileName);
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            wchar_t fromPath[MAX_PATH + 2] = {};
+            wcscpy_s(fromPath, fullPath);
+            fromPath[wcslen(fromPath) + 1] = 0;
+
+            SHFILEOPSTRUCT fileOp = {};
+            fileOp.wFunc = FO_DELETE;
+            fileOp.pFrom = fromPath;
+            fileOp.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            if (SHFileOperation(&fileOp) == 0)
+                deleted++;
+        }
+        else
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+                SetFileAttributes(fullPath, fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+            if (DeleteFile(fullPath))
+                deleted++;
+        }
+    } while (FindNextFile(hFind, &fd));
+
+    FindClose(hFind);
+    return deleted;
+}
+
+std::wstring CleanTempFiles()
+{
+    int total = 0;
+
+    // User temp folder (%TEMP%)
+    wchar_t userTemp[MAX_PATH];
+    GetTempPath(MAX_PATH, userTemp);
+    total += DeleteFolderContents(userTemp);
+
+    // Windows temp
+    total += DeleteFolderContents(L"C:\\Windows\\Temp");
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d temp files and folders.", total);
+    return result;
+}
+
+std::wstring CleanLogs()
+{
+    int total = 0;
+
+    // Windows logs
+    total += DeleteFilesInFolder(L"C:\\Windows\\Logs", L"*", true);
+    total += DeleteFilesInFolder(L"C:\\Windows\\System32\\LogFiles", L"*", true);
+
+    // User temp logs
+    wchar_t userTemp[MAX_PATH];
+    GetTempPath(MAX_PATH, userTemp);
+    total += DeleteFilesInFolder(userTemp, L"*.log", false);
+
+    // CBS logs
+    total += DeleteFilesInFolder(L"C:\\Windows\\Logs\\CBS", L"*", true);
+
+    // DISM logs
+    total += DeleteFilesInFolder(L"C:\\Windows\\Logs\\DISM", L"*", true);
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d log files.", total);
+    return result;
+}
+
+std::wstring CleanCache()
+{
+    int total = 0;
+
+    // Windows icon cache
+    wchar_t localAppData[MAX_PATH];
+    SHGetFolderPath(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData);
+
+    wchar_t iconCachePath[MAX_PATH];
+    wsprintfW(iconCachePath, L"%s\\IconCache.db", localAppData);
+    if (DeleteFile(iconCachePath)) total++;
+
+    // Windows Explorer thumbnail cache
+    wchar_t thumbCacheDir[MAX_PATH];
+    wsprintfW(thumbCacheDir, L"%s\\Microsoft\\Windows\\Explorer", localAppData);
+    total += DeleteFilesInFolder(thumbCacheDir, L"thumbcache_*", false);
+
+    // Chrome cache
+    wchar_t chromeCacheDir[MAX_PATH];
+    wsprintfW(chromeCacheDir, L"%s\\Google\\Chrome\\User Data\\Default\\Cache", localAppData);
+    total += DeleteFolderContents(chromeCacheDir);
+
+    // Edge cache
+    wchar_t edgeCacheDir[MAX_PATH];
+    wsprintfW(edgeCacheDir, L"%s\\Microsoft\\Edge\\User Data\\Default\\Cache", localAppData);
+    total += DeleteFolderContents(edgeCacheDir);
+
+    // Firefox cache
+    wchar_t firefoxDir[MAX_PATH];
+    wsprintfW(firefoxDir, L"%s\\Mozilla\\Firefox\\Profiles", localAppData);
+    WIN32_FIND_DATA fd;
+    wchar_t ffSearch[MAX_PATH];
+    wsprintfW(ffSearch, L"%s\\*", firefoxDir);
+    HANDLE hFind = FindFirstFile(ffSearch, &fd);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY &&
+                wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0)
+            {
+                wchar_t ffCachePath[MAX_PATH];
+                wsprintfW(ffCachePath, L"%s\\%s\\cache2\\entries", firefoxDir, fd.cFileName);
+                total += DeleteFolderContents(ffCachePath);
+            }
+        } while (FindNextFile(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // Windows font cache
+    total += DeleteFilesInFolder(L"C:\\Windows\\ServiceProfiles\\LocalService\\AppData\\Local", L"FontCache*", false);
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d cache files.", total);
+    return result;
+}
+
+std::wstring CleanRegistry()
+{
+    int cleaned = 0;
+
+    // Clean MUI cache
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache",
+        0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS)
+    {
+        // Enumerate and delete values
+        wchar_t valueName[512];
+        DWORD valueNameLen;
+        DWORD index = 0;
+        std::vector<std::wstring> valuesToDelete;
+
+        while (true)
+        {
+            valueNameLen = 512;
+            if (RegEnumValue(hKey, index, valueName, &valueNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            valuesToDelete.push_back(valueName);
+            index++;
+        }
+
+        for (auto& name : valuesToDelete)
+        {
+            if (RegDeleteValue(hKey, name.c_str()) == ERROR_SUCCESS)
+                cleaned++;
+        }
+        RegCloseKey(hKey);
+    }
+
+    // Clean recent docs
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs",
+        0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS)
+    {
+        // Delete the MRUListEx value to clear recent docs list
+        if (RegDeleteValue(hKey, L"MRUListEx") == ERROR_SUCCESS)
+            cleaned++;
+        RegCloseKey(hKey);
+    }
+
+    // Clean UserAssist (program usage tracking)
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist",
+        0, KEY_ALL_ACCESS, &hKey) == ERROR_SUCCESS)
+    {
+        // Enumerate subkeys and clear count values
+        wchar_t subKeyName[256];
+        DWORD subKeyNameLen;
+        DWORD index2 = 0;
+        std::vector<std::wstring> subKeys;
+
+        while (true)
+        {
+            subKeyNameLen = 256;
+            if (RegEnumKeyEx(hKey, index2, subKeyName, &subKeyNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            subKeys.push_back(subKeyName);
+            index2++;
+        }
+
+        for (auto& sk : subKeys)
+        {
+            std::wstring countPath = sk + L"\\Count";
+            HKEY hCountKey;
+            if (RegOpenKeyEx(hKey, countPath.c_str(), 0, KEY_ALL_ACCESS, &hCountKey) == ERROR_SUCCESS)
+            {
+                // Delete all values under Count
+                std::vector<std::wstring> countValues;
+                DWORD idx = 0;
+                while (true)
+                {
+                    valueNameLen = 512;
+                    if (RegEnumValue(hCountKey, idx, valueName, &valueNameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                        break;
+                    countValues.push_back(valueName);
+                    idx++;
+                }
+                for (auto& cv : countValues)
+                {
+                    if (RegDeleteValue(hCountKey, cv.c_str()) == ERROR_SUCCESS)
+                        cleaned++;
+                }
+                RegCloseKey(hCountKey);
+            }
+        }
+        RegCloseKey(hKey);
+    }
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d registry entries.", cleaned);
+    return result;
+}
+
+std::wstring CleanPrefetch()
+{
+    int total = DeleteFolderContents(L"C:\\Windows\\Prefetch");
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d prefetch files.", total);
+    return result;
+}
+
+std::wstring CleanDNS()
+{
+    STARTUPINFO si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {};
+    wchar_t cmd[] = L"ipconfig /flushdns";
+
+    BOOL ok = CreateProcess(nullptr, cmd, nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+    if (ok)
+    {
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return L"DNS cache flushed successfully.";
+    }
+
+    return L"Failed to flush DNS cache.";
+}
+
+std::wstring CleanGameFolders()
+{
+    int total = 0;
+
+    wchar_t localAppData[MAX_PATH];
+    SHGetFolderPath(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData);
+
+    wchar_t appData[MAX_PATH];
+    SHGetFolderPath(nullptr, CSIDL_APPDATA, nullptr, 0, appData);
+
+    // EpicGames launcher cache/logs
+    wchar_t epicLogsDir[MAX_PATH];
+    wsprintfW(epicLogsDir, L"%s\\EpicGamesLauncher\\Saved\\Logs", localAppData);
+    total += DeleteFolderContents(epicLogsDir);
+
+    // EpicGames webcache
+    wchar_t epicWebCache[MAX_PATH];
+    wsprintfW(epicWebCache, L"%s\\EpicGamesLauncher\\Saved\\webcache", localAppData);
+    total += DeleteFolderContents(epicWebCache);
+
+    // Fortnite logs
+    wchar_t fnLogsDir[MAX_PATH];
+    wsprintfW(fnLogsDir, L"%s\\FortniteGame\\Saved\\Logs", localAppData);
+    total += DeleteFolderContents(fnLogsDir);
+
+    // Fortnite crash reports
+    wchar_t fnCrashDir[MAX_PATH];
+    wsprintfW(fnCrashDir, L"%s\\FortniteGame\\Saved\\Crashes", localAppData);
+    total += DeleteFolderContents(fnCrashDir);
+
+    // Steam logs
+    total += DeleteFilesInFolder(L"C:\\Program Files (x86)\\Steam\\logs", L"*", true);
+
+    // Steam dumps
+    total += DeleteFilesInFolder(L"C:\\Program Files (x86)\\Steam\\dumps", L"*", true);
+
+    // Riot Games logs
+    wchar_t riotLogsDir[MAX_PATH];
+    wsprintfW(riotLogsDir, L"%s\\Riot Games\\Logs", localAppData);
+    total += DeleteFolderContents(riotLogsDir);
+
+    // Minecraft logs
+    wchar_t mcLogsDir[MAX_PATH];
+    wsprintfW(mcLogsDir, L"%s\\.minecraft\\logs", appData);
+    total += DeleteFolderContents(mcLogsDir);
+
+    // Minecraft crash reports
+    wchar_t mcCrashDir[MAX_PATH];
+    wsprintfW(mcCrashDir, L"%s\\.minecraft\\crash-reports", appData);
+    total += DeleteFolderContents(mcCrashDir);
+
+    // EA/Origin cache
+    wchar_t eaDir[MAX_PATH];
+    wsprintfW(eaDir, L"%s\\Origin\\Logs", appData);
+    total += DeleteFolderContents(eaDir);
+
+    wchar_t result[128];
+    wsprintfW(result, L"Cleaned %d game files and folders.", total);
+    return result;
+}
+
+// ============================================================
+// Disk functions
+// ============================================================
 
 DWORD GetPhysicalDiskNumber(wchar_t driveLetter)
 {
@@ -1442,10 +1823,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                     if (result == IDYES)
                     {
-                        // TODO: implement actual cleaning logic per option
-                        wchar_t doneMsg[128];
-                        wsprintfW(doneMsg, L"%s cleaning complete!", g_optionNames[i]);
-                        MessageBox(hwnd, doneMsg, L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                        std::wstring resultStr;
+                        switch (i)
+                        {
+                        case OPT_TEMP_FILES:   resultStr = CleanTempFiles(); break;
+                        case OPT_LOGS:         resultStr = CleanLogs(); break;
+                        case OPT_CACHE:        resultStr = CleanCache(); break;
+                        case OPT_REGISTRY:     resultStr = CleanRegistry(); break;
+                        case OPT_PREFETCH:     resultStr = CleanPrefetch(); break;
+                        case OPT_DNS:          resultStr = CleanDNS(); break;
+                        case OPT_GAME_FOLDERS: resultStr = CleanGameFolders(); break;
+                        }
+                        MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
                     }
 
                     InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
