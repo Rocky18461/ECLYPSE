@@ -161,6 +161,7 @@ static std::vector<DriveInfo> g_drives;
 static std::vector<RECT> g_driveBtnRects;
 static std::vector<ButtonState> g_driveBtnStates;
 static int g_selectedDrive = -1;
+static int g_cleanerScrollY = 0;
 
 // Partitions tab state
 static ButtonState g_guideBtn;
@@ -173,6 +174,7 @@ static std::vector<RECT> g_partDriveBtnRects;
 static std::vector<ButtonState> g_partDriveBtnStates;
 static int g_partSelectedDrive = -1;
 static bool g_partShowDriveSelect = false;
+static int g_partScrollY = 0;
 
 // Others tab state
 static ButtonState g_optionBtns[OPT_COUNT];
@@ -425,7 +427,7 @@ void DrawDriveSelectPanel(HDC hdc, RECT clientRect)
     // Drive buttons
     int btnWidth = 380;
     int btnHeight = 42;
-    int startY = 120;
+    int startY = 120 - g_cleanerScrollY;
     int spacing = 8;
 
     SelectObject(hdc, g_buttonFont);
@@ -924,7 +926,7 @@ void DrawPartitionsPanel(HDC hdc, RECT clientRect)
 
         int btnWidth = 380;
         int btnHeight = 42;
-        int startY = 148;
+        int startY = 148 - g_partScrollY;
         int spacing = 8;
 
         for (size_t i = 0; i < g_partDrives.size(); i++)
@@ -2666,6 +2668,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_partSelectedDrive = -1;
                 g_showRegistrySubView = false;
                 g_showRestoreLoadView = false;
+                g_cleanerScrollY = 0;
+                g_partScrollY = 0;
                 if (i == TAB_CLEANER)
                 {
                     EnumerateDrives();
@@ -3173,6 +3177,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case WM_MOUSEWHEEL:
+    {
+        int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int scrollAmount = 40;
+
+        if (g_activeTab == TAB_CLEANER)
+        {
+            g_cleanerScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_drives.size() * 50 - 200;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_cleanerScrollY < 0) g_cleanerScrollY = 0;
+            if (g_cleanerScrollY > maxScroll) g_cleanerScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_PARTITIONS && g_partShowDriveSelect)
+        {
+            g_partScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_partDrives.size() * 50 - 200;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_partScrollY < 0) g_partScrollY = 0;
+            if (g_partScrollY > maxScroll) g_partScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
     case WM_ERASEBKGND:
         return 1;
 
@@ -3243,7 +3273,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
         CLASS_NAME,
         L"ECLYPSE Cleaner",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 700, 550,
+        CW_USEDEFAULT, CW_USEDEFAULT, 700, 650,
         nullptr, nullptr, hInstance, nullptr
     );
 
