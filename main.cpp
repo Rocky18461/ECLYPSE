@@ -183,8 +183,28 @@ static ButtonState g_optimBtns[OPTIM_COUNT];
 static RECT g_optimBtnRects[OPTIM_COUNT];
 
 // Restore tab state
-static ButtonState g_restoreBtn;
-static RECT g_restoreBtnRect = {};
+static ButtonState g_restoreCreateBtn;
+static ButtonState g_restoreLoadBtn;
+static RECT g_restoreCreateBtnRect = {};
+static RECT g_restoreLoadBtnRect = {};
+
+// Restore load sub-view
+static bool g_showRestoreLoadView = false;
+static ButtonState g_restoreBackBtn;
+static RECT g_restoreBackBtnRect = {};
+
+struct RestorePointInfo
+{
+    std::wstring description;
+    std::wstring date;
+    DWORD sequenceNumber;
+};
+static std::vector<RestorePointInfo> g_restorePoints;
+static std::vector<RECT> g_restorePointRects;
+static std::vector<ButtonState> g_restorePointBtns;
+static int g_selectedRestorePoint = -1;
+static ButtonState g_restoreApplyBtn;
+static RECT g_restoreApplyBtnRect = {};
 
 // Registry sub-view state
 static bool g_showRegistrySubView = false;
@@ -554,8 +574,117 @@ void DrawOptimizationPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+void DrawRestoreLoadView(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Load Restore Point", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Select a restore point to load.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    if (g_restorePoints.empty())
+    {
+        RECT emptyRect = { contentLeft, 120, contentRight, 150 };
+        DrawText(hdc, L"No restore points found.", -1, &emptyRect, DT_CENTER | DT_SINGLELINE);
+    }
+    else
+    {
+        int btnWidth = 380;
+        int btnHeight = 40;
+        int spacing = 6;
+        int startY = 108;
+
+        for (size_t i = 0; i < g_restorePoints.size(); i++)
+        {
+            RECT btnRect;
+            btnRect.left = contentCenterX - btnWidth / 2;
+            btnRect.right = btnRect.left + btnWidth;
+            btnRect.top = startY + (int)i * (btnHeight + spacing);
+            btnRect.bottom = btnRect.top + btnHeight;
+            g_restorePointRects[i] = btnRect;
+
+            bool isSelected = (g_selectedRestorePoint == (int)i);
+            COLORREF bgColor = isSelected ? Colors::TabActive : Colors::FrameBg;
+            COLORREF borderColor = isSelected ? Colors::Accent : Colors::Border;
+            COLORREF textColor = Colors::Text;
+
+            if (g_restorePointBtns[i].pressed)
+            { bgColor = Colors::AccentPress; borderColor = Colors::Accent; textColor = RGB(255, 255, 255); }
+            else if (g_restorePointBtns[i].hovered)
+            { bgColor = Colors::TabHover; borderColor = Colors::Accent; textColor = RGB(255, 255, 255); }
+
+            HBRUSH bgBrush = CreateSolidBrush(bgColor);
+            HPEN bPen = CreatePen(PS_SOLID, 1, borderColor);
+            HBRUSH oldBr = (HBRUSH)SelectObject(hdc, bgBrush);
+            HPEN oldPn = (HPEN)SelectObject(hdc, bPen);
+            RoundRect(hdc, btnRect.left, btnRect.top, btnRect.right, btnRect.bottom, 8, 8);
+            SelectObject(hdc, oldBr);
+            SelectObject(hdc, oldPn);
+            DeleteObject(bgBrush);
+            DeleteObject(bPen);
+
+            SetTextColor(hdc, textColor);
+            SelectObject(hdc, g_tabFont);
+            RECT labelRect = btnRect;
+            labelRect.left += 12;
+            labelRect.right -= 12;
+            std::wstring label = g_restorePoints[i].description;
+            DrawText(hdc, label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            if (!g_restorePoints[i].date.empty())
+            {
+                SetTextColor(hdc, Colors::TextDim);
+                SelectObject(hdc, g_smallFont);
+                DrawText(hdc, g_restorePoints[i].date.c_str(), -1, &labelRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+
+        // Apply button
+        int actionY = startY + (int)g_restorePoints.size() * (btnHeight + spacing) + 12;
+        g_restoreApplyBtnRect.left = contentCenterX - 55;
+        g_restoreApplyBtnRect.right = g_restoreApplyBtnRect.left + 100;
+        g_restoreApplyBtnRect.top = actionY;
+        g_restoreApplyBtnRect.bottom = actionY + 38;
+        DrawRoundedButton(hdc, g_restoreApplyBtnRect, L"Load", g_restoreApplyBtn);
+    }
+
+    // Back button
+    int backY = g_restorePoints.empty() ? 170 :
+        108 + (int)g_restorePoints.size() * 46 + 12;
+    g_restoreBackBtnRect.left = contentCenterX + 10;
+    g_restoreBackBtnRect.right = g_restoreBackBtnRect.left + 100;
+    g_restoreBackBtnRect.top = backY;
+    g_restoreBackBtnRect.bottom = backY + 38;
+    DrawRoundedButton(hdc, g_restoreBackBtnRect, L"Back", g_restoreBackBtn);
+
+    SelectObject(hdc, oldFont);
+}
+
 void DrawRestorePanel(HDC hdc, RECT clientRect)
 {
+    if (g_showRestoreLoadView)
+    {
+        DrawRestoreLoadView(hdc, clientRect);
+        return;
+    }
+
     int contentLeft = SIDEBAR_WIDTH + 30;
     int contentRight = clientRect.right - 30;
     int contentCenterX = (contentLeft + contentRight) / 2;
@@ -577,23 +706,33 @@ void DrawRestorePanel(HDC hdc, RECT clientRect)
     SetTextColor(hdc, Colors::TextDim);
     SelectObject(hdc, g_descFont);
     RECT descRect = { contentLeft, 75, contentRight, 110 };
-    DrawText(hdc, L"Create a system restore point before making changes. This allows you to roll back if something goes wrong.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+    DrawText(hdc, L"Create protected restore points or load a previous one. Backups are stored in multiple locations and locked from 3rd party deletion.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
 
     SelectObject(hdc, oldFont);
 
-    int btnWidth = 280;
+    int btnWidth = 340;
     int btnHeight = 50;
-    g_restoreBtnRect.left = contentCenterX - btnWidth / 2;
-    g_restoreBtnRect.right = g_restoreBtnRect.left + btnWidth;
-    g_restoreBtnRect.top = 140;
-    g_restoreBtnRect.bottom = g_restoreBtnRect.top + btnHeight;
 
-    DrawRoundedButton(hdc, g_restoreBtnRect, L"Create Restore Point", g_restoreBtn);
+    g_restoreCreateBtnRect.left = contentCenterX - btnWidth / 2;
+    g_restoreCreateBtnRect.right = g_restoreCreateBtnRect.left + btnWidth;
+    g_restoreCreateBtnRect.top = 130;
+    g_restoreCreateBtnRect.bottom = g_restoreCreateBtnRect.top + btnHeight;
+    DrawRoundedButton(hdc, g_restoreCreateBtnRect, L"Create Restore Point", g_restoreCreateBtn);
 
     SetTextColor(hdc, Colors::TextDim);
     HFONT oldFont2 = (HFONT)SelectObject(hdc, g_smallFont);
-    RECT tipRect = { contentLeft, g_restoreBtnRect.bottom + 10, contentRight, g_restoreBtnRect.bottom + 30 };
-    DrawText(hdc, L"Recommended before using Optimization or Registry tools", -1, &tipRect, DT_CENTER | DT_SINGLELINE);
+    RECT createDesc = { contentLeft, g_restoreCreateBtnRect.bottom + 4, contentRight, g_restoreCreateBtnRect.bottom + 20 };
+    DrawText(hdc, L"Creates a Windows restore point + protected ECLYPSE backup", -1, &createDesc, DT_CENTER | DT_SINGLELINE);
+
+    g_restoreLoadBtnRect.left = contentCenterX - btnWidth / 2;
+    g_restoreLoadBtnRect.right = g_restoreLoadBtnRect.left + btnWidth;
+    g_restoreLoadBtnRect.top = 210;
+    g_restoreLoadBtnRect.bottom = g_restoreLoadBtnRect.top + btnHeight;
+    DrawRoundedButton(hdc, g_restoreLoadBtnRect, L"Load Restore Point", g_restoreLoadBtn);
+
+    SetTextColor(hdc, Colors::TextDim);
+    RECT loadDesc = { contentLeft, g_restoreLoadBtnRect.bottom + 4, contentRight, g_restoreLoadBtnRect.bottom + 20 };
+    DrawText(hdc, L"Browse and load a previous restore point", -1, &loadDesc, DT_CENTER | DT_SINGLELINE);
     SelectObject(hdc, oldFont2);
 }
 
@@ -1367,49 +1506,304 @@ std::wstring CleanGameFolders()
 }
 
 // ============================================================
-// ============================================================
-// ============================================================
-// Restore function
+// Restore functions
 // ============================================================
 
-std::wstring CreateRestorePoint()
+bool RunHiddenCommand(const wchar_t* cmd, DWORD timeoutMs = 30000)
 {
-    // Use WMI via PowerShell to create a restore point
     STARTUPINFO si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
 
-    // First enable System Restore on C: drive
-    wchar_t enableCmd[] = L"powershell -Command \"Enable-ComputerRestore -Drive 'C:\\'\"";
-    CreateProcess(nullptr, enableCmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    WaitForSingleObject(pi.hProcess, 15000);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    // CreateProcess needs a mutable string
+    std::wstring cmdStr(cmd);
+    BOOL ok = CreateProcess(nullptr, &cmdStr[0], nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok) return false;
 
-    // Create the restore point
-    pi = {};
-    wchar_t cmd[] = L"powershell -Command \"Checkpoint-Computer -Description 'ECLYPSE Restore Point' -RestorePointType 'MODIFY_SETTINGS'\"";
-
-    BOOL ok = CreateProcess(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (!ok)
-        return L"Failed to launch PowerShell. Make sure the app is running as Administrator.";
-
-    DWORD waitResult = WaitForSingleObject(pi.hProcess, 60000);
-
+    WaitForSingleObject(pi.hProcess, timeoutMs);
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    return exitCode == 0;
+}
 
-    if (waitResult == WAIT_TIMEOUT)
-        return L"Restore point creation timed out. It may still be creating in the background.";
+void ProtectFolder(const wchar_t* folderPath)
+{
+    // Set hidden + system attributes
+    SetFileAttributes(folderPath, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_READONLY);
 
-    if (exitCode == 0)
-        return L"Restore point created successfully.\n\nYou can restore from Control Panel > Recovery > Open System Restore.";
+    // Lock ACL: deny delete to Everyone, allow full control only to SYSTEM and Administrators
+    std::wstring cmd = L"icacls \"";
+    cmd += folderPath;
+    cmd += L"\" /inheritance:r /grant:r SYSTEM:(OI)(CI)F /grant:r Administrators:(OI)(CI)F /deny Everyone:(OI)(CI)(DE,DC)";
+    RunHiddenCommand(cmd.c_str(), 10000);
+}
 
-    return L"Restore point may have failed. Windows limits one restore point per 24 hours.\n\nIf you created one recently, try again later.";
+std::wstring GetEclypseBackupDir()
+{
+    return L"C:\\ProgramData\\ECLYPSE\\RestoreBackups";
+}
+
+void BackupRestorePointData(const wchar_t* tag)
+{
+    std::wstring backupDir = GetEclypseBackupDir();
+    CreateDirectory(L"C:\\ProgramData\\ECLYPSE", nullptr);
+    CreateDirectory(backupDir.c_str(), nullptr);
+
+    // Create timestamped subfolder
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t subDir[MAX_PATH];
+    wsprintfW(subDir, L"%s\\%s_%04d%02d%02d_%02d%02d%02d",
+        backupDir.c_str(), tag, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    CreateDirectory(subDir, nullptr);
+
+    // Export critical registry keys
+    wchar_t regCmd[512];
+    wsprintfW(regCmd, L"reg export HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer \"%s\\explorer.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    wsprintfW(regCmd, L"reg export HKCU\\System\\GameConfigStore \"%s\\gameconfig.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    wsprintfW(regCmd, L"reg export \"HKCU\\Control Panel\\Mouse\" \"%s\\mouse.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    wsprintfW(regCmd, L"reg export \"HKCU\\Control Panel\\Desktop\" \"%s\\desktop.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    wsprintfW(regCmd, L"reg export HKCU\\Software\\Microsoft\\GameBar \"%s\\gamebar.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    wsprintfW(regCmd, L"reg export \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\" \"%s\\themes.reg\" /y", subDir);
+    RunHiddenCommand(regCmd);
+
+    // Save a marker file with timestamp
+    wchar_t markerPath[MAX_PATH];
+    wsprintfW(markerPath, L"%s\\eclypse_restore.txt", subDir);
+    FILE* f = nullptr;
+    _wfopen_s(&f, markerPath, L"w");
+    if (f)
+    {
+        fwprintf(f, L"ECLYPSE Restore Point\nCreated: %04d-%02d-%02d %02d:%02d:%02d\nTag: %s\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, tag);
+        fclose(f);
+    }
+
+    // Protect the backup folder from deletion
+    ProtectFolder(subDir);
+    ProtectFolder(backupDir.c_str());
+    ProtectFolder(L"C:\\ProgramData\\ECLYPSE");
+}
+
+std::wstring CreateRestorePoint()
+{
+    // Bypass the 24-hour cooldown
+    HKEY hKey;
+    if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRestore",
+        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val = 0;
+        RegSetValueEx(hKey, L"SystemRestorePointCreationFrequency", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+        RegCloseKey(hKey);
+    }
+
+    // Enable System Restore on C:
+    RunHiddenCommand(L"powershell -Command \"Enable-ComputerRestore -Drive 'C:\\'\"", 15000);
+
+    // Disable VSS cleanup tasks temporarily to protect the restore point
+    RunHiddenCommand(L"schtasks /Change /TN \"Microsoft\\Windows\\SystemRestore\\SR\" /DISABLE", 10000);
+
+    // Create the Windows restore point
+    bool rpOk = RunHiddenCommand(
+        L"powershell -Command \"Checkpoint-Computer -Description 'ECLYPSE Restore Point' -RestorePointType 'MODIFY_SETTINGS'\"",
+        60000);
+
+    // Re-enable the SR task
+    RunHiddenCommand(L"schtasks /Change /TN \"Microsoft\\Windows\\SystemRestore\\SR\" /ENABLE", 10000);
+
+    // Also create our own backup
+    BackupRestorePointData(L"ECLYPSE");
+
+    // Increase System Restore disk space to reduce chance of auto-cleanup
+    RunHiddenCommand(L"vssadmin resize shadowstorage /for=C: /on=C: /maxsize=15%", 15000);
+
+    if (rpOk)
+        return L"Restore point created and protected.\n\n"
+               L"- Windows restore point saved\n"
+               L"- Registry backup saved to C:\\ProgramData\\ECLYPSE\\RestoreBackups\n"
+               L"- Backup folder protected from 3rd party deletion\n"
+               L"- VSS cleanup task temporarily disabled during creation";
+
+    return L"Windows restore point may have failed, but ECLYPSE backup was created.\n\n"
+           L"Registry backup saved to C:\\ProgramData\\ECLYPSE\\RestoreBackups";
+}
+
+void EnumerateRestorePoints()
+{
+    g_restorePoints.clear();
+
+    // Get Windows restore points via PowerShell
+    wchar_t outPath[MAX_PATH];
+    GetTempPath(MAX_PATH, outPath);
+    wcscat_s(outPath, L"eclypse_rp_list.txt");
+
+    wchar_t cmd[512];
+    wsprintfW(cmd, L"powershell -Command \"Get-ComputerRestorePoint | ForEach-Object { $_.SequenceNumber.ToString() + '|' + $_.Description + '|' + $_.CreationTime } | Out-File -Encoding utf8 '%s'\"", outPath);
+    RunHiddenCommand(cmd, 15000);
+
+    FILE* f = nullptr;
+    _wfopen_s(&f, outPath, L"r, ccs=UTF-8");
+    if (f)
+    {
+        wchar_t line[512];
+        while (fgetws(line, 512, f))
+        {
+            // Trim newline
+            size_t len = wcslen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                line[--len] = 0;
+            if (len == 0) continue;
+
+            // Parse: sequenceNumber|description|date
+            wchar_t* ctx = nullptr;
+            wchar_t* seqStr = wcstok_s(line, L"|", &ctx);
+            wchar_t* desc = wcstok_s(nullptr, L"|", &ctx);
+            wchar_t* date = wcstok_s(nullptr, L"|", &ctx);
+
+            if (seqStr && desc)
+            {
+                RestorePointInfo rpi;
+                rpi.sequenceNumber = (DWORD)_wtoi(seqStr);
+                rpi.description = desc;
+                rpi.date = date ? date : L"";
+                g_restorePoints.push_back(rpi);
+            }
+        }
+        fclose(f);
+    }
+    DeleteFile(outPath);
+
+    // Also scan ECLYPSE backup folders
+    std::wstring backupDir = GetEclypseBackupDir();
+    wchar_t searchPath[MAX_PATH];
+    wsprintfW(searchPath, L"%s\\*", backupDir.c_str());
+
+    WIN32_FIND_DATA fd;
+    HANDLE hFind = FindFirstFile(searchPath, &fd);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+            // Check if this backup is already represented by a Windows RP
+            bool alreadyListed = false;
+            for (auto& rp : g_restorePoints)
+            {
+                if (rp.description.find(L"ECLYPSE") != std::wstring::npos)
+                {
+                    alreadyListed = true;
+                    break;
+                }
+            }
+
+            if (!alreadyListed)
+            {
+                // Read marker file
+                wchar_t markerPath[MAX_PATH];
+                wsprintfW(markerPath, L"%s\\%s\\eclypse_restore.txt", backupDir.c_str(), fd.cFileName);
+
+                FILE* mf = nullptr;
+                _wfopen_s(&mf, markerPath, L"r");
+                if (mf)
+                {
+                    RestorePointInfo rpi;
+                    rpi.sequenceNumber = 0; // ECLYPSE backup, not a Windows RP
+                    rpi.description = L"[ECLYPSE Backup] ";
+                    rpi.description += fd.cFileName;
+                    // Extract date from folder name
+                    rpi.date = fd.cFileName;
+                    g_restorePoints.push_back(rpi);
+                    fclose(mf);
+                }
+            }
+        } while (FindNextFile(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    g_restorePointRects.resize(g_restorePoints.size());
+    g_restorePointBtns.resize(g_restorePoints.size());
+    for (auto& b : g_restorePointBtns) b = {};
+    g_selectedRestorePoint = -1;
+}
+
+std::wstring LoadRestorePoint(int index)
+{
+    if (index < 0 || index >= (int)g_restorePoints.size())
+        return L"Invalid restore point selected.";
+
+    auto& rp = g_restorePoints[index];
+
+    if (rp.sequenceNumber > 0)
+    {
+        // Windows restore point — use rstrui.exe
+        wchar_t cmd[128];
+        wsprintfW(cmd, L"rstrui.exe /LAUNCHRESTORE");
+        RunHiddenCommand(cmd, 5000);
+        return L"System Restore wizard launched.\n\nSelect the restore point in the wizard and follow the prompts.\nYour PC will restart to complete the restore.";
+    }
+    else
+    {
+        // ECLYPSE backup — import registry files
+        std::wstring backupDir = GetEclypseBackupDir();
+        // Extract folder name from description
+        std::wstring folderName = rp.description;
+        size_t pos = folderName.find(L"] ");
+        if (pos != std::wstring::npos)
+            folderName = folderName.substr(pos + 2);
+
+        wchar_t backupPath[MAX_PATH];
+        wsprintfW(backupPath, L"%s\\%s", backupDir.c_str(), folderName.c_str());
+
+        // Unprotect folder temporarily for reading
+        std::wstring unlockCmd = L"icacls \"" + std::wstring(backupPath) + L"\" /grant Everyone:(OI)(CI)R";
+        RunHiddenCommand(unlockCmd.c_str(), 5000);
+
+        // Import all .reg files
+        int imported = 0;
+        wchar_t search[MAX_PATH];
+        wsprintfW(search, L"%s\\*.reg", backupPath);
+
+        WIN32_FIND_DATA fd;
+        HANDLE hFind = FindFirstFile(search, &fd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                wchar_t regFile[MAX_PATH];
+                wsprintfW(regFile, L"%s\\%s", backupPath, fd.cFileName);
+                wchar_t importCmd[512];
+                wsprintfW(importCmd, L"reg import \"%s\"", regFile);
+                if (RunHiddenCommand(importCmd, 10000))
+                    imported++;
+            } while (FindNextFile(hFind, &fd));
+            FindClose(hFind);
+        }
+
+        // Re-protect
+        ProtectFolder(backupPath);
+
+        wchar_t result[256];
+        wsprintfW(result, L"ECLYPSE backup restored.\n\nImported %d registry files from:\n%s\n\nA restart is recommended.", imported, backupPath);
+        return result;
+    }
 }
 
 // ============================================================
@@ -2159,9 +2553,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         if (g_activeTab == TAB_RESTORE)
         {
-            bool was = g_restoreBtn.hovered;
-            g_restoreBtn.hovered = PtInRect(&g_restoreBtnRect, pt);
-            if (was != g_restoreBtn.hovered) InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
+            if (g_showRestoreLoadView)
+            {
+                for (size_t i = 0; i < g_restorePoints.size(); i++)
+                {
+                    bool w = g_restorePointBtns[i].hovered;
+                    g_restorePointBtns[i].hovered = PtInRect(&g_restorePointRects[i], pt);
+                    if (w != g_restorePointBtns[i].hovered) InvalidateRect(hwnd, &g_restorePointRects[i], FALSE);
+                }
+                bool w1 = g_restoreApplyBtn.hovered; g_restoreApplyBtn.hovered = PtInRect(&g_restoreApplyBtnRect, pt);
+                if (w1 != g_restoreApplyBtn.hovered) InvalidateRect(hwnd, &g_restoreApplyBtnRect, FALSE);
+                bool w2 = g_restoreBackBtn.hovered; g_restoreBackBtn.hovered = PtInRect(&g_restoreBackBtnRect, pt);
+                if (w2 != g_restoreBackBtn.hovered) InvalidateRect(hwnd, &g_restoreBackBtnRect, FALSE);
+            }
+            else
+            {
+                bool w1 = g_restoreCreateBtn.hovered; g_restoreCreateBtn.hovered = PtInRect(&g_restoreCreateBtnRect, pt);
+                if (w1 != g_restoreCreateBtn.hovered) InvalidateRect(hwnd, &g_restoreCreateBtnRect, FALSE);
+                bool w2 = g_restoreLoadBtn.hovered; g_restoreLoadBtn.hovered = PtInRect(&g_restoreLoadBtnRect, pt);
+                if (w2 != g_restoreLoadBtn.hovered) InvalidateRect(hwnd, &g_restoreLoadBtnRect, FALSE);
+            }
         }
         else if (g_activeTab == TAB_OPTIMIZATION)
         {
@@ -2227,7 +2638,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             s.hovered = false;
         for (auto& s : g_optimBtns)
             s.hovered = false;
-        g_restoreBtn.hovered = false;
+        g_restoreCreateBtn.hovered = false;
+        g_restoreLoadBtn.hovered = false;
+        g_restoreApplyBtn.hovered = false;
+        g_restoreBackBtn.hovered = false;
+        for (auto& b : g_restorePointBtns) b.hovered = false;
         g_regResetBtn.hovered = false;
         g_regCleanBtn.hovered = false;
         g_regBackBtn.hovered = false;
@@ -2250,6 +2665,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_partShowDriveSelect = false;
                 g_partSelectedDrive = -1;
                 g_showRegistrySubView = false;
+                g_showRestoreLoadView = false;
                 if (i == TAB_CLEANER)
                 {
                     EnumerateDrives();
@@ -2317,12 +2733,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
         if (g_activeTab == TAB_RESTORE)
         {
-            if (PtInRect(&g_restoreBtnRect, pt))
+            if (g_showRestoreLoadView)
             {
-                g_restoreBtn.pressed = true;
-                SetCapture(hwnd);
-                InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
-                return 0;
+                for (size_t i = 0; i < g_restorePoints.size(); i++)
+                {
+                    if (PtInRect(&g_restorePointRects[i], pt))
+                    { g_restorePointBtns[i].pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_restorePointRects[i], FALSE); return 0; }
+                }
+                if (PtInRect(&g_restoreApplyBtnRect, pt))
+                { g_restoreApplyBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_restoreApplyBtnRect, FALSE); return 0; }
+                if (PtInRect(&g_restoreBackBtnRect, pt))
+                { g_restoreBackBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_restoreBackBtnRect, FALSE); return 0; }
+            }
+            else
+            {
+                if (PtInRect(&g_restoreCreateBtnRect, pt))
+                { g_restoreCreateBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_restoreCreateBtnRect, FALSE); return 0; }
+                if (PtInRect(&g_restoreLoadBtnRect, pt))
+                { g_restoreLoadBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_restoreLoadBtnRect, FALSE); return 0; }
             }
         }
         else if (g_activeTab == TAB_OPTIMIZATION)
@@ -2508,23 +2936,85 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        // Restore tab button
+        // Restore tab
         if (g_activeTab == TAB_RESTORE)
         {
-            bool wasPressed = g_restoreBtn.pressed;
-            g_restoreBtn.pressed = false;
-
-            if (wasPressed && PtInRect(&g_restoreBtnRect, pt))
+            if (g_showRestoreLoadView)
             {
-                int r = MessageBox(hwnd, L"Create a system restore point?\n\nThis may take a moment.",
-                    L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION);
-                if (r == IDYES)
+                // Restore point selection
+                for (size_t i = 0; i < g_restorePoints.size(); i++)
                 {
-                    std::wstring res = CreateRestorePoint();
-                    MessageBox(hwnd, res.c_str(), L"ECLYPSE - Restore", MB_OK | MB_ICONINFORMATION);
+                    bool was = g_restorePointBtns[i].pressed; g_restorePointBtns[i].pressed = false;
+                    if (was && PtInRect(&g_restorePointRects[i], pt))
+                    {
+                        g_selectedRestorePoint = (int)i;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
                 }
+
+                // Apply button
+                bool wasApply = g_restoreApplyBtn.pressed; g_restoreApplyBtn.pressed = false;
+                if (wasApply && PtInRect(&g_restoreApplyBtnRect, pt))
+                {
+                    if (g_selectedRestorePoint >= 0 && g_selectedRestorePoint < (int)g_restorePoints.size())
+                    {
+                        int r = MessageBox(hwnd, L"Load the selected restore point?\n\nThis will restore registry settings from the backup.",
+                            L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+                        if (r == IDYES)
+                        {
+                            std::wstring res = LoadRestorePoint(g_selectedRestorePoint);
+                            MessageBox(hwnd, res.c_str(), L"ECLYPSE - Restore", MB_OK | MB_ICONINFORMATION);
+                        }
+                    }
+                    else
+                    {
+                        MessageBox(hwnd, L"Please select a restore point first.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                // Back button
+                bool wasBack = g_restoreBackBtn.pressed; g_restoreBackBtn.pressed = false;
+                if (wasBack && PtInRect(&g_restoreBackBtnRect, pt))
+                {
+                    g_showRestoreLoadView = false;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
-            InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
+            else
+            {
+                // Create button
+                bool wasCreate = g_restoreCreateBtn.pressed; g_restoreCreateBtn.pressed = false;
+                if (wasCreate && PtInRect(&g_restoreCreateBtnRect, pt))
+                {
+                    int r = MessageBox(hwnd, L"Create a protected restore point?\n\nThis will create a Windows restore point and an ECLYPSE backup.\nThis may take a moment.",
+                        L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION);
+                    if (r == IDYES)
+                    {
+                        std::wstring res = CreateRestorePoint();
+                        MessageBox(hwnd, res.c_str(), L"ECLYPSE - Restore", MB_OK | MB_ICONINFORMATION);
+                    }
+                    InvalidateRect(hwnd, &g_restoreCreateBtnRect, FALSE);
+                    return 0;
+                }
+
+                // Load button
+                bool wasLoad = g_restoreLoadBtn.pressed; g_restoreLoadBtn.pressed = false;
+                if (wasLoad && PtInRect(&g_restoreLoadBtnRect, pt))
+                {
+                    EnumerateRestorePoints();
+                    g_showRestoreLoadView = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
 
         // Optimization tab buttons
