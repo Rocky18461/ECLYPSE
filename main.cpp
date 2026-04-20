@@ -2212,17 +2212,48 @@ bool MergeAllPartitions(HWND hwnd, wchar_t driveLetter)
         return false;
     }
 
-    wchar_t confirmMsg[256];
-    wsprintfW(confirmMsg,
-        L"This will DELETE ALL partitions on Disk %u and create a single NTFS volume.\n\n"
-        L"ALL data on every partition of this disk will be permanently lost.\n\n"
-        L"Are you sure?", diskNumber);
+    // Find all partitions on this physical disk
+    std::wstring partitionList;
+    int partCount = 0;
+    DWORD driveMask = GetLogicalDrives();
+    for (int i = 0; i < 26; i++)
+    {
+        if (!(driveMask & (1 << i))) continue;
+        wchar_t letter = L'A' + i;
+        DWORD dn = GetPhysicalDiskNumber(letter);
+        if (dn == diskNumber)
+        {
+            wchar_t root[] = { letter, L':', L'\\', 0 };
+            wchar_t volName[MAX_PATH] = {};
+            GetVolumeInformation(root, volName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
 
-    if (MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm Merge", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+            ULARGE_INTEGER totalBytes = {}, freeBytes = {};
+            GetDiskFreeSpaceEx(root, nullptr, &totalBytes, &freeBytes);
+            std::wstring sizeStr = FormatBytes(totalBytes.QuadPart);
+
+            wchar_t line[256];
+            wsprintfW(line, L"  %c:\\  %s  (%s)\n", letter, volName[0] ? volName : L"(unnamed)", sizeStr.c_str());
+            partitionList += line;
+            partCount++;
+        }
+    }
+
+    std::wstring confirmMsg = L"This will DELETE ALL partitions on Disk ";
+    confirmMsg += std::to_wstring(diskNumber);
+    confirmMsg += L" and create a single NTFS volume.\n\n";
+    confirmMsg += std::to_wstring(partCount);
+    confirmMsg += L" partition(s) will be PERMANENTLY DELETED:\n\n";
+    confirmMsg += partitionList;
+    confirmMsg += L"\nALL data on these partitions will be lost.\n\nAre you sure?";
+
+    if (MessageBox(hwnd, confirmMsg.c_str(), L"ECLYPSE - Confirm Merge", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return false;
 
-    if (MessageBox(hwnd, L"LAST CHANCE: This cannot be undone. Proceed?",
-        L"ECLYPSE - Final Warning", MB_YESNO | MB_ICONERROR | MB_DEFBUTTON2) != IDYES)
+    std::wstring lastChance = L"LAST CHANCE: The following partitions will be wiped:\n\n";
+    lastChance += partitionList;
+    lastChance += L"\nThis cannot be undone. Proceed?";
+
+    if (MessageBox(hwnd, lastChance.c_str(), L"ECLYPSE - Final Warning", MB_YESNO | MB_ICONERROR | MB_DEFBUTTON2) != IDYES)
         return false;
 
     // Generate diskpart script
