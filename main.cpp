@@ -3621,7 +3621,87 @@ void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
         return; // User cancelled
     }
 
-    // Create diskpart script to make partition from unallocated space
+    // Ask for partition size
+    wchar_t sizeVbsPath[MAX_PATH];
+    GetTempPath(MAX_PATH, sizeVbsPath);
+    wcscat_s(sizeVbsPath, L"eclypse_size_input.vbs");
+
+    wchar_t sizeOutPath[MAX_PATH];
+    GetTempPath(MAX_PATH, sizeOutPath);
+    wcscat_s(sizeOutPath, L"eclypse_size_result.txt");
+    DeleteFile(sizeOutPath);
+
+    ULONGLONG diskSizeGB = GetPhysicalDiskSize(diskNumber) / (1024ULL * 1024ULL * 1024ULL);
+
+    FILE* svbs = nullptr;
+    _wfopen_s(&svbs, sizeVbsPath, L"w");
+    if (svbs)
+    {
+        fwprintf(svbs,
+            L"Dim result\n"
+            L"result = InputBox(\"Enter partition size in GB:\" & vbCrLf & vbCrLf & \"Disk total: %llu GB\" & vbCrLf & \"Leave blank or type MAX to use all unallocated space.\", \"ECLYPSE - Partition Size\", \"50\")\n"
+            L"If result <> \"\" Then\n"
+            L"  Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+            L"  Set f = fso.CreateTextFile(\"%s\", True)\n"
+            L"  f.Write result\n"
+            L"  f.Close\n"
+            L"End If\n", diskSizeGB, sizeOutPath);
+        fclose(svbs);
+    }
+
+    wchar_t sizeVbsCmd[MAX_PATH + 32];
+    swprintf_s(sizeVbsCmd, MAX_PATH + 32, L"wscript \"%s\"", sizeVbsPath);
+
+    pi = {};
+    if (CreateProcess(nullptr, sizeVbsCmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+    {
+        WaitForSingleObject(pi.hProcess, 60000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    DeleteFile(sizeVbsPath);
+
+    ULONGLONG partSizeMB = 0; // 0 = use all
+    bool useAll = false;
+    FILE* srf = nullptr;
+    _wfopen_s(&srf, sizeOutPath, L"r");
+    if (srf)
+    {
+        wchar_t sizeBuf[64] = {};
+        fgetws(sizeBuf, 64, srf);
+        fclose(srf);
+        DeleteFile(sizeOutPath);
+
+        // Trim
+        size_t slen = wcslen(sizeBuf);
+        while (slen > 0 && (sizeBuf[slen - 1] == '\n' || sizeBuf[slen - 1] == '\r'))
+            sizeBuf[--slen] = 0;
+
+        if (_wcsicmp(sizeBuf, L"MAX") == 0 || _wcsicmp(sizeBuf, L"max") == 0)
+        {
+            useAll = true;
+        }
+        else
+        {
+            int val = _wtoi(sizeBuf);
+            if (val >= 1)
+            {
+                partSizeMB = (ULONGLONG)val * 1024;
+            }
+            else
+            {
+                MessageBox(hwnd, L"Invalid size entered. Cancelled.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
+    }
+    else
+    {
+        DeleteFile(sizeOutPath);
+        return; // User cancelled
+    }
+
+    // Create diskpart script
     wchar_t scriptPath[MAX_PATH];
     GetTempPath(MAX_PATH, scriptPath);
     wcscat_s(scriptPath, L"eclypse_unalloc.txt");
@@ -3635,7 +3715,10 @@ void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
     }
 
     fwprintf(sf, L"select disk %u\n", diskNumber);
-    fwprintf(sf, L"create partition primary\n");  // Uses all remaining unallocated space
+    if (useAll)
+        fwprintf(sf, L"create partition primary\n");
+    else
+        fwprintf(sf, L"create partition primary size=%llu\n", partSizeMB);
     fwprintf(sf, L"format fs=ntfs label=\"%s\" quick\n", label);
     fwprintf(sf, L"assign\n");
 
