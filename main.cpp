@@ -175,6 +175,8 @@ static std::vector<RECT> g_driveBtnRects;
 static std::vector<ButtonState> g_driveBtnStates;
 static int g_selectedDrive = -1;
 static int g_cleanerScrollY = 0;
+static ButtonState g_experimentalBtn;
+static RECT g_experimentalBtnRect = {};
 
 // Partitions tab state
 static ButtonState g_guideBtn;
@@ -1128,6 +1130,22 @@ void DrawDriveSelectPanel(HDC hdc, RECT clientRect)
         RECT statusRect = { contentLeft, g_actionBtnRect.bottom + 10, contentRight, g_actionBtnRect.bottom + 35 };
         DrawText(hdc, L"Select a drive above", -1, &statusRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
+
+    // Experimental button
+    int expBtnW = 200;
+    int expBtnH = 40;
+    int expBtnY = g_actionBtnRect.bottom + 50;
+    g_experimentalBtnRect.left = contentCenterX - expBtnW / 2;
+    g_experimentalBtnRect.right = g_experimentalBtnRect.left + expBtnW;
+    g_experimentalBtnRect.top = expBtnY;
+    g_experimentalBtnRect.bottom = expBtnY + expBtnH;
+
+    DrawRoundedButton(hdc, g_experimentalBtnRect, L"Experimental", g_experimentalBtn);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_smallFont);
+    RECT expDesc = { contentLeft, g_experimentalBtnRect.bottom + 4, contentRight, g_experimentalBtnRect.bottom + 20 };
+    DrawText(hdc, L"Create partition from unallocated disk space", -1, &expDesc, DT_CENTER | DT_SINGLELINE);
 
     SelectObject(hdc, oldFont);
 }
@@ -3454,6 +3472,217 @@ void ShowWindowsInstallGuide(HWND hwnd)
     MessageBox(hwnd, guide, L"ECLYPSE - Windows 10 Installation Guide", MB_OK | MB_ICONINFORMATION);
 }
 
+void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
+{
+    DWORD diskNumber = GetPhysicalDiskNumber(driveLetter);
+    if (diskNumber == (DWORD)-1)
+    {
+        MessageBox(hwnd, L"Could not determine physical disk number from the selected drive.",
+            L"ECLYPSE", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    // First, query disk to check for unallocated space using diskpart
+    wchar_t queryScriptPath[MAX_PATH];
+    GetTempPath(MAX_PATH, queryScriptPath);
+    wcscat_s(queryScriptPath, L"eclypse_query_disk.txt");
+
+    wchar_t queryOutPath[MAX_PATH];
+    GetTempPath(MAX_PATH, queryOutPath);
+    wcscat_s(queryOutPath, L"eclypse_query_disk_out.txt");
+
+    FILE* qf = nullptr;
+    _wfopen_s(&qf, queryScriptPath, L"w");
+    if (!qf)
+    {
+        MessageBox(hwnd, L"Failed to create diskpart script.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+        return;
+    }
+    fwprintf(qf, L"select disk %u\nlist partition\n", diskNumber);
+    fclose(qf);
+
+    // Run diskpart and capture output
+    wchar_t queryCmd[MAX_PATH * 2];
+    swprintf_s(queryCmd, MAX_PATH * 2, L"cmd /c diskpart /s \"%s\" > \"%s\"", queryScriptPath, queryOutPath);
+
+    STARTUPINFO si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    if (!CreateProcess(nullptr, queryCmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    {
+        MessageBox(hwnd, L"Failed to run diskpart. Make sure the app is running as Administrator.",
+            L"ECLYPSE", MB_OK | MB_ICONERROR);
+        DeleteFile(queryScriptPath);
+        return;
+    }
+
+    WaitForSingleObject(pi.hProcess, 15000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    DeleteFile(queryScriptPath);
+
+    // Read output to show the user current partition layout
+    std::wstring diskInfo;
+    FILE* rf = nullptr;
+    _wfopen_s(&rf, queryOutPath, L"r, ccs=UTF-8");
+    if (rf)
+    {
+        wchar_t line[512];
+        while (fgetws(line, 512, rf))
+        {
+            // Only include lines with "Partition" or disk size info
+            if (wcsstr(line, L"Partition") || wcsstr(line, L"partition"))
+                diskInfo += line;
+        }
+        fclose(rf);
+    }
+    DeleteFile(queryOutPath);
+
+    // Get disk size for reference
+    ULONGLONG diskSize = GetPhysicalDiskSize(diskNumber);
+    std::wstring diskSizeStr = FormatBytes(diskSize);
+
+    std::wstring confirmMsg = L"Disk ";
+    confirmMsg += std::to_wstring(diskNumber);
+    confirmMsg += L" (";
+    confirmMsg += diskSizeStr;
+    confirmMsg += L")\n\nCurrent partitions:\n";
+    confirmMsg += diskInfo.empty() ? L"  (could not read partition list)\n" : diskInfo;
+    confirmMsg += L"\nThis will create a new NTFS partition using all\n";
+    confirmMsg += L"unallocated space on this disk.\n\n";
+    confirmMsg += L"No existing partitions will be deleted.\n\n";
+    confirmMsg += L"Proceed?";
+
+    if (MessageBox(hwnd, confirmMsg.c_str(), L"ECLYPSE - Experimental", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    // Ask for custom label
+    wchar_t vbsPath[MAX_PATH];
+    GetTempPath(MAX_PATH, vbsPath);
+    wcscat_s(vbsPath, L"eclypse_label_input.vbs");
+
+    wchar_t labelOutPath[MAX_PATH];
+    GetTempPath(MAX_PATH, labelOutPath);
+    wcscat_s(labelOutPath, L"eclypse_label_result.txt");
+    DeleteFile(labelOutPath);
+
+    FILE* vbs = nullptr;
+    _wfopen_s(&vbs, vbsPath, L"w");
+    if (vbs)
+    {
+        fwprintf(vbs,
+            L"Dim result\n"
+            L"result = InputBox(\"Enter label for the new partition:\", \"ECLYPSE - Partition Label\", \"ECLYPSE_NEW\")\n"
+            L"If result <> \"\" Then\n"
+            L"  Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+            L"  Set f = fso.CreateTextFile(\"%s\", True)\n"
+            L"  f.Write result\n"
+            L"  f.Close\n"
+            L"End If\n", labelOutPath);
+        fclose(vbs);
+    }
+
+    wchar_t vbsCmd[MAX_PATH + 32];
+    swprintf_s(vbsCmd, MAX_PATH + 32, L"wscript \"%s\"", vbsPath);
+
+    pi = {};
+    if (CreateProcess(nullptr, vbsCmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+    {
+        WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    DeleteFile(vbsPath);
+
+    wchar_t label[64] = L"ECLYPSE_NEW";
+    FILE* lf = nullptr;
+    _wfopen_s(&lf, labelOutPath, L"r");
+    if (lf)
+    {
+        wchar_t labelBuf[64] = {};
+        fgetws(labelBuf, 64, lf);
+        fclose(lf);
+        DeleteFile(labelOutPath);
+
+        // Trim newline
+        size_t len = wcslen(labelBuf);
+        while (len > 0 && (labelBuf[len - 1] == '\n' || labelBuf[len - 1] == '\r'))
+            labelBuf[--len] = 0;
+
+        if (len > 0)
+            wcscpy_s(label, labelBuf);
+    }
+    else
+    {
+        DeleteFile(labelOutPath);
+        return; // User cancelled
+    }
+
+    // Create diskpart script to make partition from unallocated space
+    wchar_t scriptPath[MAX_PATH];
+    GetTempPath(MAX_PATH, scriptPath);
+    wcscat_s(scriptPath, L"eclypse_unalloc.txt");
+
+    FILE* sf = nullptr;
+    _wfopen_s(&sf, scriptPath, L"w");
+    if (!sf)
+    {
+        MessageBox(hwnd, L"Failed to create diskpart script.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    fwprintf(sf, L"select disk %u\n", diskNumber);
+    fwprintf(sf, L"create partition primary\n");  // Uses all remaining unallocated space
+    fwprintf(sf, L"format fs=ntfs label=\"%s\" quick\n", label);
+    fwprintf(sf, L"assign\n");
+
+    fclose(sf);
+
+    wchar_t cmdLine[MAX_PATH + 32];
+    swprintf_s(cmdLine, MAX_PATH + 32, L"diskpart /s \"%s\"", scriptPath);
+
+    pi = {};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    BOOL created = CreateProcess(nullptr, cmdLine, nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+
+    if (!created)
+    {
+        MessageBox(hwnd, L"Failed to run diskpart. Make sure the app is running as Administrator.",
+            L"ECLYPSE", MB_OK | MB_ICONERROR);
+        DeleteFile(scriptPath);
+        return;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    DeleteFile(scriptPath);
+
+    if (exitCode != 0)
+    {
+        MessageBox(hwnd,
+            L"Diskpart failed. Possible causes:\n\n"
+            L"- No unallocated space on the disk\n"
+            L"- Disk is GPT and needs conversion\n"
+            L"- Insufficient permissions",
+            L"ECLYPSE", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    wchar_t successMsg[256];
+    swprintf_s(successMsg, 256, L"New partition created from unallocated space.\n\nLabel: %s\nFormat: NTFS\n\nDrive letter assigned automatically.", label);
+    MessageBox(hwnd, successMsg, L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
+}
+
 void WipeDrive(HWND hwnd, wchar_t driveLetter)
 {
     wchar_t msg[512];
@@ -3751,6 +3980,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 if (wasHov != g_driveBtnStates[i].hovered)
                     InvalidateRect(hwnd, &g_driveBtnRects[i], FALSE);
             }
+            bool wasExp = g_experimentalBtn.hovered;
+            g_experimentalBtn.hovered = PtInRect(&g_experimentalBtnRect, pt);
+            if (wasExp != g_experimentalBtn.hovered)
+                InvalidateRect(hwnd, &g_experimentalBtnRect, FALSE);
         }
         else if (g_activeTab == TAB_PARTITIONS)
         {
@@ -3911,6 +4144,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
         g_hoveredTab = -1;
         g_actionBtn.hovered = false;
+        g_experimentalBtn.hovered = false;
         g_backBtn.hovered = false;
         g_guideBtn.hovered = false;
         g_mergeBtn.hovered = false;
@@ -3995,6 +4229,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     InvalidateRect(hwnd, &g_driveBtnRects[i], FALSE);
                     return 0;
                 }
+            }
+            if (PtInRect(&g_experimentalBtnRect, pt))
+            {
+                g_experimentalBtn.pressed = true;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_experimentalBtnRect, FALSE);
+                return 0;
             }
         }
         else if (g_activeTab == TAB_PARTITIONS)
@@ -4179,6 +4420,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+            }
+
+            // Experimental button
+            bool wasExp = g_experimentalBtn.pressed;
+            g_experimentalBtn.pressed = false;
+            if (wasExp && PtInRect(&g_experimentalBtnRect, pt))
+            {
+                if (g_selectedDrive >= 0 && g_selectedDrive < (int)g_drives.size())
+                {
+                    CreatePartitionFromUnallocated(hwnd, g_drives[g_selectedDrive].letter);
+                    EnumerateDrives();
+                    g_selectedDrive = -1;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                else
+                {
+                    MessageBox(hwnd, L"Please select a drive first.\n\nThe unallocated space on that drive's physical disk will be used.",
+                        L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                return 0;
             }
         }
 
