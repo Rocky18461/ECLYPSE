@@ -3211,17 +3211,16 @@ ULONGLONG GetPhysicalDiskSize(DWORD diskNumber)
     return ok ? lenInfo.Length.QuadPart : 0;
 }
 
-bool CreatePartitions(HWND hwnd, DWORD diskNumber, ULONGLONG diskSizeBytes)
+bool CreatePartitions(HWND hwnd, DWORD diskNumber, ULONGLONG diskSizeBytes, ULONGLONG partitionSizeGB = 100)
 {
-    // Generate diskpart script
-    // Each partition is 100GB (102400 MB), fill remaining space into the last one
-    constexpr ULONGLONG PARTITION_SIZE_MB = 102400; // 100 GB
+    ULONGLONG PARTITION_SIZE_MB = partitionSizeGB * 1024;
     ULONGLONG diskSizeMB = diskSizeBytes / (1024ULL * 1024ULL);
 
-    // Reserve ~1MB for GPT overhead
     if (diskSizeMB < PARTITION_SIZE_MB + 2)
     {
-        MessageBox(hwnd, L"Disk is too small for 100GB partitions.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+        wchar_t errMsg[128];
+        swprintf_s(errMsg, 128, L"Disk is too small for %llu GB partitions.", partitionSizeGB);
+        MessageBox(hwnd, errMsg, L"ECLYPSE", MB_OK | MB_ICONERROR);
         return false;
     }
 
@@ -3303,7 +3302,7 @@ bool CreatePartitions(HWND hwnd, DWORD diskNumber, ULONGLONG diskSizeBytes)
     }
 
     wchar_t successMsg[128];
-    wsprintfW(successMsg, L"Created %d partitions (100 GB each, NTFS).", numPartitions);
+    swprintf_s(successMsg, 128, L"Created %d partitions (%llu GB each, NTFS).", numPartitions, partitionSizeGB);
     MessageBox(hwnd, successMsg, L"ECLYPSE - Partitioning Complete", MB_OK | MB_ICONINFORMATION);
     return true;
 }
@@ -3536,17 +3535,112 @@ void WipeDrive(HWND hwnd, wchar_t driveLetter)
         FindClose(hFind);
     }
 
-    wchar_t resultMsg[256];
+    wchar_t resultMsg[512];
     wsprintfW(resultMsg,
         L"Wipe complete for %c:\\\n\n"
         L"Deleted: %d files, %d folders\n"
         L"Failed: %d items (may be in use or protected)\n\n"
-        L"Proceed to create 100 GB partitions?",
+        L"Create partitions on this disk?\n\n"
+        L"  Yes  -  Create 100 GB partitions\n"
+        L"  No   -  Skip partitioning\n"
+        L"  Cancel  -  Custom partition size",
         driveLetter, deletedFiles, deletedDirs, failed);
 
-    int partResult = MessageBox(hwnd, resultMsg, L"ECLYPSE - Wipe Complete", MB_YESNO | MB_ICONQUESTION);
-    if (partResult != IDYES)
-        return;
+    int partResult = MessageBox(hwnd, resultMsg, L"ECLYPSE - Wipe Complete", MB_YESNOCANCEL | MB_ICONQUESTION);
+
+    ULONGLONG partSizeGB = 100;
+
+    if (partResult == IDCANCEL)
+    {
+        // Custom size - ask user for input via a simple input dialog
+        // Use a prompt loop with MessageBox + registry trick for input
+        // Simpler approach: use a series of size options
+        int choice = MessageBox(hwnd,
+            L"Choose partition size:\n\n"
+            L"  Yes  =  50 GB\n"
+            L"  No   =  Enter manually",
+            L"ECLYPSE - Partition Size", MB_YESNO | MB_ICONQUESTION);
+
+        if (choice == IDYES)
+        {
+            partSizeGB = 50;
+        }
+        else
+        {
+            // Use a simple input - create a temp VBS input box
+            wchar_t vbsPath[MAX_PATH];
+            GetTempPath(MAX_PATH, vbsPath);
+            wcscat_s(vbsPath, L"eclypse_input.vbs");
+
+            wchar_t outPath[MAX_PATH];
+            GetTempPath(MAX_PATH, outPath);
+            wcscat_s(outPath, L"eclypse_input_result.txt");
+
+            DeleteFile(outPath);
+
+            FILE* vbs = nullptr;
+            _wfopen_s(&vbs, vbsPath, L"w");
+            if (vbs)
+            {
+                fwprintf(vbs,
+                    L"Dim result\n"
+                    L"result = InputBox(\"Enter partition size in GB:\", \"ECLYPSE - Custom Partition Size\", \"100\")\n"
+                    L"If result <> \"\" Then\n"
+                    L"  Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+                    L"  Set f = fso.CreateTextFile(\"%s\", True)\n"
+                    L"  f.Write result\n"
+                    L"  f.Close\n"
+                    L"End If\n", outPath);
+                fclose(vbs);
+            }
+
+            wchar_t vbsCmd[MAX_PATH + 32];
+            swprintf_s(vbsCmd, MAX_PATH + 32, L"wscript \"%s\"", vbsPath);
+
+            STARTUPINFO si = {};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi = {};
+            if (CreateProcess(nullptr, vbsCmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+            {
+                WaitForSingleObject(pi.hProcess, 30000);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+            }
+
+            DeleteFile(vbsPath);
+
+            // Read the result
+            FILE* rf = nullptr;
+            _wfopen_s(&rf, outPath, L"r");
+            if (rf)
+            {
+                wchar_t sizeBuf[32] = {};
+                fgetws(sizeBuf, 32, rf);
+                fclose(rf);
+                DeleteFile(outPath);
+
+                int val = _wtoi(sizeBuf);
+                if (val >= 1 && val <= 100000)
+                {
+                    partSizeGB = (ULONGLONG)val;
+                }
+                else
+                {
+                    MessageBox(hwnd, L"Invalid size entered. Partitioning cancelled.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+                    return;
+                }
+            }
+            else
+            {
+                DeleteFile(outPath);
+                return; // User cancelled the input box
+            }
+        }
+    }
+    else if (partResult != IDYES)
+    {
+        return; // User chose No - skip
+    }
 
     // Get physical disk number and size
     DWORD diskNumber = GetPhysicalDiskNumber(driveLetter);
@@ -3563,7 +3657,7 @@ void WipeDrive(HWND hwnd, wchar_t driveLetter)
         return;
     }
 
-    CreatePartitions(hwnd, diskNumber, diskSize);
+    CreatePartitions(hwnd, diskNumber, diskSize, partSizeGB);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
