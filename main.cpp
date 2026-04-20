@@ -179,6 +179,15 @@ static RECT g_optionBtnRects[OPT_COUNT];
 static ButtonState g_optimBtns[OPTIM_COUNT];
 static RECT g_optimBtnRects[OPTIM_COUNT];
 
+// Registry sub-view state
+static bool g_showRegistrySubView = false;
+static ButtonState g_regResetBtn;
+static ButtonState g_regCleanBtn;
+static ButtonState g_regBackBtn;
+static RECT g_regResetBtnRect = {};
+static RECT g_regCleanBtnRect = {};
+static RECT g_regBackBtnRect = {};
+
 constexpr int SIDEBAR_WIDTH = 150;
 constexpr int TAB_HEIGHT = 38;
 constexpr int TAB_TOP_OFFSET = 60;
@@ -538,7 +547,7 @@ void DrawOptimizationPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
-void DrawOthersPanel(HDC hdc, RECT clientRect)
+void DrawRegistrySubView(HDC hdc, RECT clientRect)
 {
     int contentLeft = SIDEBAR_WIDTH + 30;
     int contentRight = clientRect.right - 30;
@@ -546,13 +555,81 @@ void DrawOthersPanel(HDC hdc, RECT clientRect)
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Header
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Registry", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 105 };
+    DrawText(hdc, L"Choose a registry action below.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    int btnWidth = 340;
+    int btnHeight = 50;
+
+    // Reset to Default button
+    g_regResetBtnRect.left = contentCenterX - btnWidth / 2;
+    g_regResetBtnRect.right = g_regResetBtnRect.left + btnWidth;
+    g_regResetBtnRect.top = 130;
+    g_regResetBtnRect.bottom = g_regResetBtnRect.top + btnHeight;
+    DrawRoundedButton(hdc, g_regResetBtnRect, L"Reset to Default", g_regResetBtn);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_smallFont);
+    RECT resetDesc = { contentLeft, g_regResetBtnRect.bottom + 4, contentRight, g_regResetBtnRect.bottom + 20 };
+    DrawText(hdc, L"Undo optimizations and restore registry to Windows defaults", -1, &resetDesc, DT_CENTER | DT_SINGLELINE);
+
+    // Clean Registry button
+    g_regCleanBtnRect.left = contentCenterX - btnWidth / 2;
+    g_regCleanBtnRect.right = g_regCleanBtnRect.left + btnWidth;
+    g_regCleanBtnRect.top = 210;
+    g_regCleanBtnRect.bottom = g_regCleanBtnRect.top + btnHeight;
+    DrawRoundedButton(hdc, g_regCleanBtnRect, L"Clean Registry", g_regCleanBtn);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_smallFont);
+    RECT cleanDesc = { contentLeft, g_regCleanBtnRect.bottom + 4, contentRight, g_regCleanBtnRect.bottom + 20 };
+    DrawText(hdc, L"Clean MUI cache, recent docs, and UserAssist tracking data", -1, &cleanDesc, DT_CENTER | DT_SINGLELINE);
+
+    // Back button
+    int backW = 120;
+    int backH = 36;
+    g_regBackBtnRect.left = contentCenterX - backW / 2;
+    g_regBackBtnRect.right = g_regBackBtnRect.left + backW;
+    g_regBackBtnRect.top = 300;
+    g_regBackBtnRect.bottom = g_regBackBtnRect.top + backH;
+    DrawRoundedButton(hdc, g_regBackBtnRect, L"Back", g_regBackBtn);
+
+    SelectObject(hdc, oldFont);
+}
+
+void DrawOthersPanel(HDC hdc, RECT clientRect)
+{
+    if (g_showRegistrySubView)
+    {
+        DrawRegistrySubView(hdc, clientRect);
+        return;
+    }
+
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
     SetTextColor(hdc, Colors::Text);
     HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
     RECT headerRect = { contentLeft, 25, contentRight, 55 };
     DrawText(hdc, L"Others", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // Separator
     HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
     HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
     MoveToEx(hdc, contentLeft, 65, nullptr);
@@ -565,7 +642,6 @@ void DrawOthersPanel(HDC hdc, RECT clientRect)
     RECT descRect = { contentLeft, 75, contentRight, 100 };
     DrawText(hdc, L"Clean temp files, logs, caches, registry, prefetch, DNS, and game folders.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
 
-    // Option buttons - two columns
     int btnWidth = 190;
     int btnHeight = 42;
     int spacing = 10;
@@ -1040,6 +1116,105 @@ std::wstring CleanRegistry()
 
     wchar_t result[128];
     wsprintfW(result, L"Cleaned %d registry entries.", cleaned);
+    return result;
+}
+
+std::wstring ResetRegistry()
+{
+    // Export current registry as backup, then reset key areas to defaults
+    // This resets user-level customizations that may cause issues
+
+    int reset = 0;
+
+    // Reset Explorer settings to defaults
+    RegDeleteTree(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced");
+    HKEY hKey;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val1 = 1;
+        DWORD val0 = 0;
+        RegSetValueEx(hKey, L"Hidden", 0, REG_DWORD, (BYTE*)&val1, sizeof(DWORD));
+        RegSetValueEx(hKey, L"HideFileExt", 0, REG_DWORD, (BYTE*)&val0, sizeof(DWORD));
+        RegSetValueEx(hKey, L"ShowSuperHidden", 0, REG_DWORD, (BYTE*)&val0, sizeof(DWORD));
+        RegSetValueEx(hKey, L"LaunchTo", 0, REG_DWORD, (BYTE*)&val1, sizeof(DWORD));
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    // Reset desktop settings
+    RegDeleteTree(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects");
+    if (RegCreateKeyEx(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects",
+        0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
+    {
+        DWORD val = 0; // 0 = Let Windows choose
+        RegSetValueEx(hKey, L"VisualFXSetting", 0, REG_DWORD, (BYTE*)&val, sizeof(DWORD));
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    // Reset mouse settings to defaults
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Mouse", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        RegSetValueEx(hKey, L"MouseSpeed", 0, REG_SZ, (BYTE*)L"1", 4);
+        RegSetValueEx(hKey, L"MouseThreshold1", 0, REG_SZ, (BYTE*)L"6", 4);
+        RegSetValueEx(hKey, L"MouseThreshold2", 0, REG_SZ, (BYTE*)L"10", 6);
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    // Reset GameDVR / Game Bar to defaults (enabled)
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"System\\GameConfigStore", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD val1 = 1;
+        RegSetValueEx(hKey, L"GameDVR_Enabled", 0, REG_DWORD, (BYTE*)&val1, sizeof(DWORD));
+        RegDeleteValue(hKey, L"GameDVR_FSEBehaviorMode");
+        RegDeleteValue(hKey, L"GameDVR_HonorUserFSEBehaviorMode");
+        RegDeleteValue(hKey, L"GameDVR_FSEBehavior");
+        RegDeleteValue(hKey, L"GameDVR_DXGIHonorFSEWindowsCompatible");
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    // Reset transparency to enabled
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS)
+    {
+        DWORD val1 = 1;
+        RegSetValueEx(hKey, L"EnableTransparency", 0, REG_DWORD, (BYTE*)&val1, sizeof(DWORD));
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    // Remove Nagle tweaks (delete TcpAckFrequency / TCPNoDelay from interfaces)
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces",
+        0, KEY_ENUMERATE_SUB_KEYS, &hKey) == ERROR_SUCCESS)
+    {
+        wchar_t subKeyName[256];
+        DWORD index = 0;
+        DWORD nameLen;
+        while (true)
+        {
+            nameLen = 256;
+            if (RegEnumKeyEx(hKey, index, subKeyName, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            HKEY hSubKey;
+            if (RegOpenKeyEx(hKey, subKeyName, 0, KEY_SET_VALUE, &hSubKey) == ERROR_SUCCESS)
+            {
+                RegDeleteValue(hSubKey, L"TcpAckFrequency");
+                RegDeleteValue(hSubKey, L"TCPNoDelay");
+                RegCloseKey(hSubKey);
+            }
+            index++;
+        }
+        RegCloseKey(hKey);
+        reset++;
+    }
+
+    wchar_t result[128];
+    wsprintfW(result, L"Reset %d registry areas to Windows defaults.\nA restart is recommended.", reset);
     return result;
 }
 
@@ -1895,12 +2070,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
         else if (g_activeTab == TAB_OTHERS)
         {
-            for (int i = 0; i < OPT_COUNT; i++)
+            if (g_showRegistrySubView)
             {
-                bool wasHov = g_optionBtns[i].hovered;
-                g_optionBtns[i].hovered = PtInRect(&g_optionBtnRects[i], pt);
-                if (wasHov != g_optionBtns[i].hovered)
-                    InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
+                bool w1 = g_regResetBtn.hovered; g_regResetBtn.hovered = PtInRect(&g_regResetBtnRect, pt);
+                if (w1 != g_regResetBtn.hovered) InvalidateRect(hwnd, &g_regResetBtnRect, FALSE);
+                bool w2 = g_regCleanBtn.hovered; g_regCleanBtn.hovered = PtInRect(&g_regCleanBtnRect, pt);
+                if (w2 != g_regCleanBtn.hovered) InvalidateRect(hwnd, &g_regCleanBtnRect, FALSE);
+                bool w3 = g_regBackBtn.hovered; g_regBackBtn.hovered = PtInRect(&g_regBackBtnRect, pt);
+                if (w3 != g_regBackBtn.hovered) InvalidateRect(hwnd, &g_regBackBtnRect, FALSE);
+            }
+            else
+            {
+                for (int i = 0; i < OPT_COUNT; i++)
+                {
+                    bool wasHov = g_optionBtns[i].hovered;
+                    g_optionBtns[i].hovered = PtInRect(&g_optionBtnRects[i], pt);
+                    if (wasHov != g_optionBtns[i].hovered)
+                        InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
+                }
             }
         }
 
@@ -1935,6 +2122,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             s.hovered = false;
         for (auto& s : g_optimBtns)
             s.hovered = false;
+        g_regResetBtn.hovered = false;
+        g_regCleanBtn.hovered = false;
+        g_regBackBtn.hovered = false;
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -1953,6 +2143,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_actionBtn = {};
                 g_partShowDriveSelect = false;
                 g_partSelectedDrive = -1;
+                g_showRegistrySubView = false;
                 if (i == TAB_CLEANER)
                 {
                     EnumerateDrives();
@@ -2033,14 +2224,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
         else if (g_activeTab == TAB_OTHERS)
         {
-            for (int i = 0; i < OPT_COUNT; i++)
+            if (g_showRegistrySubView)
             {
-                if (PtInRect(&g_optionBtnRects[i], pt))
+                if (PtInRect(&g_regResetBtnRect, pt))
+                { g_regResetBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_regResetBtnRect, FALSE); return 0; }
+                if (PtInRect(&g_regCleanBtnRect, pt))
+                { g_regCleanBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_regCleanBtnRect, FALSE); return 0; }
+                if (PtInRect(&g_regBackBtnRect, pt))
+                { g_regBackBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_regBackBtnRect, FALSE); return 0; }
+            }
+            else
+            {
+                for (int i = 0; i < OPT_COUNT; i++)
                 {
-                    g_optionBtns[i].pressed = true;
-                    SetCapture(hwnd);
-                    InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
-                    return 0;
+                    if (PtInRect(&g_optionBtnRects[i], pt))
+                    {
+                        g_optionBtns[i].pressed = true;
+                        SetCapture(hwnd);
+                        InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
+                        return 0;
+                    }
                 }
             }
         }
@@ -2226,39 +2429,93 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        // Others tab option buttons
+        // Others tab
         if (g_activeTab == TAB_OTHERS)
         {
-            for (int i = 0; i < OPT_COUNT; i++)
+            if (g_showRegistrySubView)
             {
-                bool wasPressed = g_optionBtns[i].pressed;
-                g_optionBtns[i].pressed = false;
-
-                if (wasPressed && PtInRect(&g_optionBtnRects[i], pt))
+                // Reset to Default
+                bool wasReset = g_regResetBtn.pressed; g_regResetBtn.pressed = false;
+                if (wasReset && PtInRect(&g_regResetBtnRect, pt))
                 {
-                    wchar_t confirmMsg[256];
-                    wsprintfW(confirmMsg, L"Are you sure you want to clean %s?\n\n%s\n\nThis action cannot be undone.",
-                        g_optionNames[i], g_optionDescs[i]);
-                    int result = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-
-                    if (result == IDYES)
+                    int r = MessageBox(hwnd, L"Reset registry to Windows defaults?\n\nThis will undo any optimizations applied by ECLYPSE.\nA restart is recommended after.",
+                        L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+                    if (r == IDYES)
                     {
-                        std::wstring resultStr;
-                        switch (i)
-                        {
-                        case OPT_TEMP_FILES:   resultStr = CleanTempFiles(); break;
-                        case OPT_LOGS:         resultStr = CleanLogs(); break;
-                        case OPT_CACHE:        resultStr = CleanCache(); break;
-                        case OPT_REGISTRY:     resultStr = CleanRegistry(); break;
-                        case OPT_PREFETCH:     resultStr = CleanPrefetch(); break;
-                        case OPT_DNS:          resultStr = CleanDNS(); break;
-                        case OPT_GAME_FOLDERS: resultStr = CleanGameFolders(); break;
-                        }
-                        MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
+                        std::wstring res = ResetRegistry();
+                        MessageBox(hwnd, res.c_str(), L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
                     }
-
-                    InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
+                    InvalidateRect(hwnd, &g_regResetBtnRect, FALSE);
                     return 0;
+                }
+
+                // Clean Registry
+                bool wasClean = g_regCleanBtn.pressed; g_regCleanBtn.pressed = false;
+                if (wasClean && PtInRect(&g_regCleanBtnRect, pt))
+                {
+                    int r = MessageBox(hwnd, L"Clean registry?\n\nThis will remove MUI cache, recent docs, and UserAssist tracking data.\n\nThis action cannot be undone.",
+                        L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+                    if (r == IDYES)
+                    {
+                        std::wstring res = CleanRegistry();
+                        MessageBox(hwnd, res.c_str(), L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
+                    }
+                    InvalidateRect(hwnd, &g_regCleanBtnRect, FALSE);
+                    return 0;
+                }
+
+                // Back
+                bool wasBack = g_regBackBtn.pressed; g_regBackBtn.pressed = false;
+                if (wasBack && PtInRect(&g_regBackBtnRect, pt))
+                {
+                    g_showRegistrySubView = false;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            else
+            {
+                for (int i = 0; i < OPT_COUNT; i++)
+                {
+                    bool wasPressed = g_optionBtns[i].pressed;
+                    g_optionBtns[i].pressed = false;
+
+                    if (wasPressed && PtInRect(&g_optionBtnRects[i], pt))
+                    {
+                        // Registry opens sub-view instead of directly cleaning
+                        if (i == OPT_REGISTRY)
+                        {
+                            g_showRegistrySubView = true;
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+
+                        wchar_t confirmMsg[256];
+                        wsprintfW(confirmMsg, L"Are you sure you want to clean %s?\n\n%s\n\nThis action cannot be undone.",
+                            g_optionNames[i], g_optionDescs[i]);
+                        int result = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+
+                        if (result == IDYES)
+                        {
+                            std::wstring resultStr;
+                            switch (i)
+                            {
+                            case OPT_TEMP_FILES:   resultStr = CleanTempFiles(); break;
+                            case OPT_LOGS:         resultStr = CleanLogs(); break;
+                            case OPT_CACHE:        resultStr = CleanCache(); break;
+                            case OPT_PREFETCH:     resultStr = CleanPrefetch(); break;
+                            case OPT_DNS:          resultStr = CleanDNS(); break;
+                            case OPT_GAME_FOLDERS: resultStr = CleanGameFolders(); break;
+                            }
+                            MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Complete", MB_OK | MB_ICONINFORMATION);
+                        }
+
+                        InvalidateRect(hwnd, &g_optionBtnRects[i], FALSE);
+                        return 0;
+                    }
                 }
             }
         }
@@ -2359,7 +2616,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
     HWND hwnd = CreateWindowEx(
         0,
         CLASS_NAME,
-        L"ECLYPSE",
+        L"ECLYPSE Cleaner",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 700, 550,
         nullptr, nullptr, hInstance, nullptr
