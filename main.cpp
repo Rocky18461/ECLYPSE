@@ -42,6 +42,7 @@ enum Tab
     TAB_CLEANER,
     TAB_PARTITIONS,
     TAB_OPTIMIZATION,
+    TAB_RESTORE,
     TAB_OTHERS, // always last
     TAB_COUNT
 };
@@ -50,6 +51,7 @@ static const wchar_t* g_tabNames[TAB_COUNT] = {
     L"Cleaner",
     L"Partitions",
     L"Optimization",
+    L"Restore",
     L"Others"
 };
 
@@ -57,6 +59,7 @@ static const wchar_t* g_tabDescriptions[TAB_COUNT] = {
     L"Wipe an entire drive. All data will be permanently deleted.",
     L"Manage disk partitions and Windows installation guide.",
     L"Optimize Windows settings for maximum gaming performance.",
+    L"Create a Windows system restore point.",
     L"Clean temp files, logs, caches, registry, prefetch, DNS, and game folders."
 };
 
@@ -178,6 +181,10 @@ static RECT g_optionBtnRects[OPT_COUNT];
 // Optimization tab state
 static ButtonState g_optimBtns[OPTIM_COUNT];
 static RECT g_optimBtnRects[OPTIM_COUNT];
+
+// Restore tab state
+static ButtonState g_restoreBtn;
+static RECT g_restoreBtnRect = {};
 
 // Registry sub-view state
 static bool g_showRegistrySubView = false;
@@ -547,6 +554,49 @@ void DrawOptimizationPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+void DrawRestorePanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Restore", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 110 };
+    DrawText(hdc, L"Create a system restore point before making changes. This allows you to roll back if something goes wrong.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    SelectObject(hdc, oldFont);
+
+    int btnWidth = 280;
+    int btnHeight = 50;
+    g_restoreBtnRect.left = contentCenterX - btnWidth / 2;
+    g_restoreBtnRect.right = g_restoreBtnRect.left + btnWidth;
+    g_restoreBtnRect.top = 140;
+    g_restoreBtnRect.bottom = g_restoreBtnRect.top + btnHeight;
+
+    DrawRoundedButton(hdc, g_restoreBtnRect, L"Create Restore Point", g_restoreBtn);
+
+    SetTextColor(hdc, Colors::TextDim);
+    HFONT oldFont2 = (HFONT)SelectObject(hdc, g_smallFont);
+    RECT tipRect = { contentLeft, g_restoreBtnRect.bottom + 10, contentRight, g_restoreBtnRect.bottom + 30 };
+    DrawText(hdc, L"Recommended before using Optimization or Registry tools", -1, &tipRect, DT_CENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont2);
+}
+
 void DrawRegistrySubView(HDC hdc, RECT clientRect)
 {
     int contentLeft = SIDEBAR_WIDTH + 30;
@@ -829,6 +879,10 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
     else if (g_activeTab == TAB_OPTIMIZATION)
     {
         DrawOptimizationPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_RESTORE)
+    {
+        DrawRestorePanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_OTHERS)
     {
@@ -1313,6 +1367,51 @@ std::wstring CleanGameFolders()
 }
 
 // ============================================================
+// ============================================================
+// ============================================================
+// Restore function
+// ============================================================
+
+std::wstring CreateRestorePoint()
+{
+    // Use WMI via PowerShell to create a restore point
+    STARTUPINFO si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    // First enable System Restore on C: drive
+    wchar_t enableCmd[] = L"powershell -Command \"Enable-ComputerRestore -Drive 'C:\\'\"";
+    CreateProcess(nullptr, enableCmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    WaitForSingleObject(pi.hProcess, 15000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    // Create the restore point
+    pi = {};
+    wchar_t cmd[] = L"powershell -Command \"Checkpoint-Computer -Description 'ECLYPSE Restore Point' -RestorePointType 'MODIFY_SETTINGS'\"";
+
+    BOOL ok = CreateProcess(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    if (!ok)
+        return L"Failed to launch PowerShell. Make sure the app is running as Administrator.";
+
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, 60000);
+
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (waitResult == WAIT_TIMEOUT)
+        return L"Restore point creation timed out. It may still be creating in the background.";
+
+    if (exitCode == 0)
+        return L"Restore point created successfully.\n\nYou can restore from Control Panel > Recovery > Open System Restore.";
+
+    return L"Restore point may have failed. Windows limits one restore point per 24 hours.\n\nIf you created one recently, try again later.";
+}
+
 // ============================================================
 // Optimization functions
 // ============================================================
@@ -2058,7 +2157,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (g_activeTab == TAB_OPTIMIZATION)
+        if (g_activeTab == TAB_RESTORE)
+        {
+            bool was = g_restoreBtn.hovered;
+            g_restoreBtn.hovered = PtInRect(&g_restoreBtnRect, pt);
+            if (was != g_restoreBtn.hovered) InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
+        }
+        else if (g_activeTab == TAB_OPTIMIZATION)
         {
             for (int i = 0; i < OPTIM_COUNT; i++)
             {
@@ -2122,6 +2227,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             s.hovered = false;
         for (auto& s : g_optimBtns)
             s.hovered = false;
+        g_restoreBtn.hovered = false;
         g_regResetBtn.hovered = false;
         g_regCleanBtn.hovered = false;
         g_regBackBtn.hovered = false;
@@ -2209,7 +2315,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (g_activeTab == TAB_OPTIMIZATION)
+        if (g_activeTab == TAB_RESTORE)
+        {
+            if (PtInRect(&g_restoreBtnRect, pt))
+            {
+                g_restoreBtn.pressed = true;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
+                return 0;
+            }
+        }
+        else if (g_activeTab == TAB_OPTIMIZATION)
         {
             for (int i = 0; i < OPTIM_COUNT; i++)
             {
@@ -2390,6 +2506,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+        }
+
+        // Restore tab button
+        if (g_activeTab == TAB_RESTORE)
+        {
+            bool wasPressed = g_restoreBtn.pressed;
+            g_restoreBtn.pressed = false;
+
+            if (wasPressed && PtInRect(&g_restoreBtnRect, pt))
+            {
+                int r = MessageBox(hwnd, L"Create a system restore point?\n\nThis may take a moment.",
+                    L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION);
+                if (r == IDYES)
+                {
+                    std::wstring res = CreateRestorePoint();
+                    MessageBox(hwnd, res.c_str(), L"ECLYPSE - Restore", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            InvalidateRect(hwnd, &g_restoreBtnRect, FALSE);
         }
 
         // Optimization tab buttons
