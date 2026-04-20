@@ -278,14 +278,20 @@ void EnumerateDrives()
 std::wstring FormatBytes(ULONGLONG bytes)
 {
     wchar_t buf[64];
-    if (bytes >= (1ULL << 40))
-        wsprintfW(buf, L"%llu GB", bytes / (1ULL << 30));
-    else if (bytes >= (1ULL << 30))
-        wsprintfW(buf, L"%.1f GB", (double)bytes / (1ULL << 30));
+    if (bytes >= (1ULL << 30))
+    {
+        ULONGLONG gbWhole = bytes / (1ULL << 30);
+        ULONGLONG gbFrac = (bytes % (1ULL << 30)) * 10 / (1ULL << 30);
+        swprintf_s(buf, 64, L"%llu.%llu GB", gbWhole, gbFrac);
+    }
     else if (bytes >= (1ULL << 20))
-        wsprintfW(buf, L"%llu MB", bytes / (1ULL << 20));
+    {
+        swprintf_s(buf, 64, L"%llu MB", bytes / (1ULL << 20));
+    }
     else
-        wsprintfW(buf, L"%llu KB", bytes / (1ULL << 10));
+    {
+        swprintf_s(buf, 64, L"%llu KB", bytes / (1ULL << 10));
+    }
     return buf;
 }
 
