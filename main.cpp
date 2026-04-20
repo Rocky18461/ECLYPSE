@@ -3641,8 +3641,13 @@ void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
 
     fclose(sf);
 
-    wchar_t cmdLine[MAX_PATH + 32];
-    swprintf_s(cmdLine, MAX_PATH + 32, L"diskpart /s \"%s\"", scriptPath);
+    // Capture diskpart output
+    wchar_t dpOutPath[MAX_PATH];
+    GetTempPath(MAX_PATH, dpOutPath);
+    wcscat_s(dpOutPath, L"eclypse_unalloc_out.txt");
+
+    wchar_t cmdLine[MAX_PATH * 2];
+    swprintf_s(cmdLine, MAX_PATH * 2, L"cmd /c diskpart /s \"%s\" > \"%s\" 2>&1", scriptPath, dpOutPath);
 
     pi = {};
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -3659,7 +3664,7 @@ void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
         return;
     }
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    WaitForSingleObject(pi.hProcess, 60000);
 
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -3667,14 +3672,41 @@ void CreatePartitionFromUnallocated(HWND hwnd, wchar_t driveLetter)
     CloseHandle(pi.hThread);
     DeleteFile(scriptPath);
 
-    if (exitCode != 0)
+    // Read diskpart output
+    std::wstring dpOutput;
+    FILE* dpf = nullptr;
+    _wfopen_s(&dpf, dpOutPath, L"r, ccs=UTF-8");
+    if (dpf)
     {
-        MessageBox(hwnd,
-            L"Diskpart failed. Possible causes:\n\n"
-            L"- No unallocated space on the disk\n"
-            L"- Disk is GPT and needs conversion\n"
-            L"- Insufficient permissions",
-            L"ECLYPSE", MB_OK | MB_ICONERROR);
+        wchar_t line[512];
+        while (fgetws(line, 512, dpf))
+            dpOutput += line;
+        fclose(dpf);
+    }
+    DeleteFile(dpOutPath);
+
+    // Check for errors in the output (diskpart often returns 0 even on failure)
+    bool hasError = (exitCode != 0) ||
+        dpOutput.find(L"error") != std::wstring::npos ||
+        dpOutput.find(L"Error") != std::wstring::npos ||
+        dpOutput.find(L"There is no usable free extent") != std::wstring::npos ||
+        dpOutput.find(L"cannot be used") != std::wstring::npos ||
+        dpOutput.find(L"not enough") != std::wstring::npos;
+
+    // Also check if "successfully" appears (positive confirmation)
+    bool hasSuccess = dpOutput.find(L"successfully") != std::wstring::npos ||
+        dpOutput.find(L"DiskPart succeeded") != std::wstring::npos;
+
+    if (hasError && !hasSuccess)
+    {
+        std::wstring errMsg = L"Diskpart output:\n\n";
+        // Trim to last ~500 chars to fit in MessageBox
+        if (dpOutput.size() > 500)
+            errMsg += dpOutput.substr(dpOutput.size() - 500);
+        else
+            errMsg += dpOutput;
+
+        MessageBox(hwnd, errMsg.c_str(), L"ECLYPSE - Diskpart Failed", MB_OK | MB_ICONERROR);
         return;
     }
 
