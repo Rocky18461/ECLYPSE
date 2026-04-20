@@ -4,6 +4,7 @@
 #include <ShlObj.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <shlwapi.h>
 
@@ -43,6 +44,10 @@ enum Tab
     TAB_PARTITIONS,
     TAB_OPTIMIZATION,
     TAB_RESTORE,
+    TAB_STARTUP,
+    TAB_DEBLOATER,
+    TAB_SYSINFO,
+    TAB_UNINSTALLER,
     TAB_OTHERS, // always last
     TAB_COUNT
 };
@@ -52,6 +57,10 @@ static const wchar_t* g_tabNames[TAB_COUNT] = {
     L"Partitions",
     L"Optimization",
     L"Restore",
+    L"Startup",
+    L"Debloater",
+    L"System Info",
+    L"Uninstaller",
     L"Others"
 };
 
@@ -60,6 +69,10 @@ static const wchar_t* g_tabDescriptions[TAB_COUNT] = {
     L"Manage disk partitions and Windows installation guide.",
     L"Optimize Windows settings for maximum gaming performance.",
     L"Create a Windows system restore point.",
+    L"Manage programs that run at Windows startup.",
+    L"Remove unwanted Windows bloatware apps.",
+    L"View detailed system hardware and software information.",
+    L"Uninstall programs from your system.",
     L"Clean temp files, logs, caches, registry, prefetch, DNS, and game folders."
 };
 
@@ -217,6 +230,95 @@ static RECT g_regResetBtnRect = {};
 static RECT g_regCleanBtnRect = {};
 static RECT g_regBackBtnRect = {};
 
+// ============================================================
+// Startup Manager tab state
+// ============================================================
+struct StartupItem
+{
+    std::wstring name;
+    std::wstring path;
+    std::wstring source; // "Registry HKCU", "Registry HKLM", "Startup Folder"
+    bool enabled;
+    HKEY hiveKey; // HKCU or HKLM for registry items
+    std::wstring regValueName; // original value name in registry
+};
+static std::vector<StartupItem> g_startupItems;
+static std::vector<RECT> g_startupItemRects;
+static std::vector<ButtonState> g_startupItemBtns;
+static int g_startupScrollY = 0;
+static bool g_startupLoaded = false;
+static ButtonState g_startupDisableAllBtn;
+static ButtonState g_startupEnableAllBtn;
+static ButtonState g_startupRefreshBtn;
+static RECT g_startupDisableAllBtnRect = {};
+static RECT g_startupEnableAllBtnRect = {};
+static RECT g_startupRefreshBtnRect = {};
+
+// ============================================================
+// Debloater tab state
+// ============================================================
+struct BloatwareItem
+{
+    std::wstring packageName;
+    std::wstring displayName;
+    bool installed;
+    bool selected;
+};
+static std::vector<BloatwareItem> g_bloatItems;
+static std::vector<RECT> g_bloatItemRects;
+static std::vector<ButtonState> g_bloatItemBtns;
+static int g_debloaterScrollY = 0;
+static bool g_debloaterLoaded = false;
+static ButtonState g_bloatSelectAllBtn;
+static ButtonState g_bloatDeselectAllBtn;
+static ButtonState g_bloatRemoveBtn;
+static RECT g_bloatSelectAllBtnRect = {};
+static RECT g_bloatDeselectAllBtnRect = {};
+static RECT g_bloatRemoveBtnRect = {};
+
+// ============================================================
+// System Info tab state
+// ============================================================
+struct SysInfoLine
+{
+    std::wstring label;
+    std::wstring value;
+};
+static std::vector<SysInfoLine> g_sysInfoLines;
+static bool g_sysInfoLoaded = false;
+static int g_sysInfoScrollY = 0;
+static ButtonState g_sysInfoRefreshBtn;
+static ButtonState g_sysInfoCopyBtn;
+static RECT g_sysInfoRefreshBtnRect = {};
+static RECT g_sysInfoCopyBtnRect = {};
+
+// ============================================================
+// Uninstaller tab state
+// ============================================================
+struct UninstallItem
+{
+    std::wstring displayName;
+    std::wstring publisher;
+    std::wstring version;
+    DWORD estimatedSize; // in KB
+    std::wstring uninstallString;
+    bool selected;
+};
+static std::vector<UninstallItem> g_uninstallItems;
+static std::vector<RECT> g_uninstallItemRects;
+static std::vector<ButtonState> g_uninstallItemBtns;
+static int g_uninstallScrollY = 0;
+static bool g_uninstallLoaded = false;
+static ButtonState g_uninstallBtn;
+static ButtonState g_uninstallAllBtn;
+static ButtonState g_uninstallRefreshBtn;
+static RECT g_uninstallBtnRect = {};
+static RECT g_uninstallAllBtnRect = {};
+static RECT g_uninstallRefreshBtnRect = {};
+
+// Forward declarations
+bool RunHiddenCommand(const wchar_t* cmd, DWORD timeoutMs = 30000);
+
 constexpr int SIDEBAR_WIDTH = 150;
 constexpr int TAB_HEIGHT = 38;
 constexpr int TAB_TOP_OFFSET = 60;
@@ -273,6 +375,506 @@ void EnumerateDrives()
     g_driveBtnStates.resize(g_drives.size());
     for (auto& s : g_driveBtnStates)
         s = {};
+}
+
+// ============================================================
+// Startup Manager enumeration
+// ============================================================
+void EnumerateStartupItems()
+{
+    g_startupItems.clear();
+
+    // Helper lambda to read from a registry Run key
+    auto readRegRun = [](HKEY hive, const wchar_t* path, const wchar_t* sourceLabel)
+    {
+        HKEY hKey;
+        if (RegOpenKeyEx(hive, path, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+            return;
+
+        DWORD index = 0;
+        wchar_t valueName[512];
+        DWORD valueNameLen;
+        BYTE data[2048];
+        DWORD dataLen;
+        DWORD type;
+
+        while (true)
+        {
+            valueNameLen = 512;
+            dataLen = sizeof(data);
+            if (RegEnumValue(hKey, index, valueName, &valueNameLen, nullptr, &type, data, &dataLen) != ERROR_SUCCESS)
+                break;
+
+            if (type == REG_SZ || type == REG_EXPAND_SZ)
+            {
+                StartupItem item;
+                std::wstring vn(valueName);
+                bool disabled = false;
+                if (vn.find(L"~ECLYPSE~") == 0)
+                {
+                    disabled = true;
+                    item.name = vn.substr(9); // remove prefix
+                }
+                else
+                {
+                    item.name = vn;
+                }
+                item.regValueName = valueName;
+                item.path = (wchar_t*)data;
+                item.source = sourceLabel;
+                item.enabled = !disabled;
+                item.hiveKey = hive;
+                g_startupItems.push_back(item);
+            }
+            index++;
+        }
+        RegCloseKey(hKey);
+    };
+
+    readRegRun(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"Registry HKCU");
+    readRegRun(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", L"Registry HKLM");
+
+    // Shell startup folder
+    wchar_t startupPath[MAX_PATH];
+    if (SHGetFolderPath(nullptr, CSIDL_STARTUP, nullptr, 0, startupPath) == S_OK)
+    {
+        wchar_t search[MAX_PATH];
+        wsprintfW(search, L"%s\\*", startupPath);
+        WIN32_FIND_DATA fd;
+        HANDLE hFind = FindFirstFile(search, &fd);
+        if (hFind != INVALID_HANDLE_VALUE)
+        {
+            // Check for Disabled subfolder
+            wchar_t disabledDir[MAX_PATH];
+            wsprintfW(disabledDir, L"%s\\Disabled", startupPath);
+
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                StartupItem item;
+                item.name = fd.cFileName;
+                wchar_t fullPath[MAX_PATH];
+                wsprintfW(fullPath, L"%s\\%s", startupPath, fd.cFileName);
+                item.path = fullPath;
+                item.source = L"Startup Folder";
+                item.enabled = true;
+                item.hiveKey = nullptr;
+                g_startupItems.push_back(item);
+            } while (FindNextFile(hFind, &fd));
+            FindClose(hFind);
+
+            // Also check Disabled subfolder
+            wchar_t disSearch[MAX_PATH];
+            wsprintfW(disSearch, L"%s\\*", disabledDir);
+            hFind = FindFirstFile(disSearch, &fd);
+            if (hFind != INVALID_HANDLE_VALUE)
+            {
+                do
+                {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                    if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+
+                    StartupItem item;
+                    item.name = fd.cFileName;
+                    wchar_t fullPath[MAX_PATH];
+                    wsprintfW(fullPath, L"%s\\%s", disabledDir, fd.cFileName);
+                    item.path = fullPath;
+                    item.source = L"Startup Folder";
+                    item.enabled = false;
+                    item.hiveKey = nullptr;
+                    g_startupItems.push_back(item);
+                } while (FindNextFile(hFind, &fd));
+                FindClose(hFind);
+            }
+        }
+    }
+
+    g_startupItemRects.resize(g_startupItems.size());
+    g_startupItemBtns.resize(g_startupItems.size());
+    for (auto& b : g_startupItemBtns) b = {};
+}
+
+void ToggleStartupItem(int index)
+{
+    if (index < 0 || index >= (int)g_startupItems.size()) return;
+    auto& item = g_startupItems[index];
+
+    if (item.source == L"Startup Folder")
+    {
+        wchar_t startupPath[MAX_PATH];
+        SHGetFolderPath(nullptr, CSIDL_STARTUP, nullptr, 0, startupPath);
+        wchar_t disabledDir[MAX_PATH];
+        wsprintfW(disabledDir, L"%s\\Disabled", startupPath);
+
+        if (item.enabled)
+        {
+            // Move to Disabled subfolder
+            CreateDirectory(disabledDir, nullptr);
+            wchar_t dest[MAX_PATH];
+            wsprintfW(dest, L"%s\\%s", disabledDir, item.name.c_str());
+            MoveFile(item.path.c_str(), dest);
+            item.path = dest;
+            item.enabled = false;
+        }
+        else
+        {
+            // Move back to startup folder
+            wchar_t dest[MAX_PATH];
+            wsprintfW(dest, L"%s\\%s", startupPath, item.name.c_str());
+            MoveFile(item.path.c_str(), dest);
+            item.path = dest;
+            item.enabled = true;
+        }
+    }
+    else
+    {
+        // Registry item
+        const wchar_t* regPath = (item.source == L"Registry HKCU")
+            ? L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+            : L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+        HKEY hKey;
+        if (RegOpenKeyEx(item.hiveKey, regPath, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey) == ERROR_SUCCESS)
+        {
+            // Read current value data
+            BYTE data[2048];
+            DWORD dataLen = sizeof(data);
+            DWORD type = 0;
+            RegQueryValueEx(hKey, item.regValueName.c_str(), nullptr, &type, data, &dataLen);
+
+            // Delete old value
+            RegDeleteValue(hKey, item.regValueName.c_str());
+
+            if (item.enabled)
+            {
+                // Disable: prepend ~ECLYPSE~ to value name
+                std::wstring newName = L"~ECLYPSE~" + item.name;
+                RegSetValueEx(hKey, newName.c_str(), 0, type, data, dataLen);
+                item.regValueName = newName;
+                item.enabled = false;
+            }
+            else
+            {
+                // Enable: remove ~ECLYPSE~ prefix
+                RegSetValueEx(hKey, item.name.c_str(), 0, type, data, dataLen);
+                item.regValueName = item.name;
+                item.enabled = true;
+            }
+            RegCloseKey(hKey);
+        }
+    }
+}
+
+// ============================================================
+// Debloater enumeration
+// ============================================================
+void InitBloatwareList()
+{
+    g_bloatItems.clear();
+
+    struct BloatDef { const wchar_t* pkg; const wchar_t* display; };
+    static const BloatDef defs[] = {
+        { L"Microsoft.3DBuilder", L"3D Builder" },
+        { L"Microsoft.BingWeather", L"Bing Weather" },
+        { L"Microsoft.GetHelp", L"Get Help" },
+        { L"Microsoft.Getstarted", L"Get Started / Tips" },
+        { L"Microsoft.Microsoft3DViewer", L"3D Viewer" },
+        { L"Microsoft.MicrosoftOfficeHub", L"Office Hub" },
+        { L"Microsoft.MicrosoftSolitaireCollection", L"Solitaire Collection" },
+        { L"Microsoft.MixedReality.Portal", L"Mixed Reality Portal" },
+        { L"Microsoft.OneConnect", L"OneConnect" },
+        { L"Microsoft.People", L"People" },
+        { L"Microsoft.SkypeApp", L"Skype" },
+        { L"Microsoft.WindowsAlarms", L"Alarms & Clock" },
+        { L"Microsoft.WindowsFeedbackHub", L"Feedback Hub" },
+        { L"Microsoft.WindowsMaps", L"Maps" },
+        { L"Microsoft.WindowsSoundRecorder", L"Sound Recorder" },
+        { L"Microsoft.Xbox.TCUI", L"Xbox TCUI" },
+        { L"Microsoft.XboxApp", L"Xbox App" },
+        { L"Microsoft.XboxGameOverlay", L"Xbox Game Overlay" },
+        { L"Microsoft.XboxGamingOverlay", L"Xbox Gaming Overlay" },
+        { L"Microsoft.XboxIdentityProvider", L"Xbox Identity" },
+        { L"Microsoft.XboxSpeechToTextOverlay", L"Xbox Speech" },
+        { L"Microsoft.YourPhone", L"Your Phone" },
+        { L"Microsoft.ZuneMusic", L"Groove Music" },
+        { L"Microsoft.ZuneVideo", L"Movies & TV" },
+        { L"Microsoft.WindowsCommunicationsApps", L"Mail & Calendar" },
+        { L"king.com.CandyCrushSaga", L"Candy Crush Saga" },
+        { L"king.com.CandyCrushSodaSaga", L"Candy Crush Soda Saga" },
+        { L"Microsoft.Advertising.Xaml", L"Advertising XAML" },
+        { L"Microsoft.MSPaint", L"Paint 3D" },
+        { L"Microsoft.MicrosoftEdge", L"Legacy Edge" },
+        { L"Clipchamp.Clipchamp", L"Clipchamp" },
+        { L"Microsoft.Todos", L"Microsoft To Do" },
+        { L"Microsoft.PowerAutomateDesktop", L"Power Automate" },
+        { L"MicrosoftTeams", L"Microsoft Teams" },
+    };
+
+    for (auto& d : defs)
+    {
+        BloatwareItem bi;
+        bi.packageName = d.pkg;
+        bi.displayName = d.display;
+        bi.installed = false;
+        bi.selected = false;
+        g_bloatItems.push_back(bi);
+    }
+}
+
+void CheckInstalledBloatware()
+{
+    // Build a single PowerShell command to check all packages at once
+    std::wstring cmd = L"powershell -Command \"$pkgs = @(";
+    for (size_t i = 0; i < g_bloatItems.size(); i++)
+    {
+        if (i > 0) cmd += L",";
+        cmd += L"'" + g_bloatItems[i].packageName + L"'";
+    }
+    cmd += L"); foreach($p in $pkgs){ $r = Get-AppxPackage -Name $p -ErrorAction SilentlyContinue; if($r){ Write-Output $p } }\"";
+
+    // Write output to temp file
+    wchar_t outPath[MAX_PATH];
+    GetTempPath(MAX_PATH, outPath);
+    wcscat_s(outPath, L"eclypse_bloat_check.txt");
+
+    std::wstring fullCmd = cmd + L" > \"" + outPath + L"\"";
+    RunHiddenCommand(fullCmd.c_str(), 30000);
+
+    // Read results
+    FILE* f = nullptr;
+    _wfopen_s(&f, outPath, L"r, ccs=UTF-8");
+    if (f)
+    {
+        wchar_t line[512];
+        while (fgetws(line, 512, f))
+        {
+            size_t len = wcslen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+                line[--len] = 0;
+            if (len == 0) continue;
+
+            for (auto& bi : g_bloatItems)
+            {
+                if (_wcsicmp(bi.packageName.c_str(), line) == 0)
+                {
+                    bi.installed = true;
+                    break;
+                }
+            }
+        }
+        fclose(f);
+    }
+    DeleteFile(outPath);
+
+    g_bloatItemRects.clear();
+    g_bloatItemBtns.clear();
+    // Count installed items for rect/btn sizing
+    int count = 0;
+    for (auto& bi : g_bloatItems)
+        if (bi.installed) count++;
+    g_bloatItemRects.resize(count);
+    g_bloatItemBtns.resize(count);
+    for (auto& b : g_bloatItemBtns) b = {};
+}
+
+// ============================================================
+// System Info enumeration
+// ============================================================
+void GatherSystemInfo()
+{
+    g_sysInfoLines.clear();
+
+    // CPU
+    {
+        HKEY hKey;
+        wchar_t cpuName[256] = L"Unknown";
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+        {
+            DWORD sz = sizeof(cpuName);
+            RegQueryValueEx(hKey, L"ProcessorNameString", nullptr, nullptr, (BYTE*)cpuName, &sz);
+            RegCloseKey(hKey);
+        }
+        g_sysInfoLines.push_back({ L"CPU", cpuName });
+    }
+
+    // GPU
+    {
+        HKEY hKey;
+        wchar_t gpuName[256] = L"Unknown";
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+        {
+            DWORD sz = sizeof(gpuName);
+            RegQueryValueEx(hKey, L"DriverDesc", nullptr, nullptr, (BYTE*)gpuName, &sz);
+            RegCloseKey(hKey);
+        }
+        g_sysInfoLines.push_back({ L"GPU", gpuName });
+    }
+
+    // RAM
+    {
+        MEMORYSTATUSEX ms = {};
+        ms.dwLength = sizeof(ms);
+        GlobalMemoryStatusEx(&ms);
+        ULONGLONG totalGB = ms.ullTotalPhys / (1024ULL * 1024ULL * 1024ULL);
+        ULONGLONG totalMBRem = (ms.ullTotalPhys % (1024ULL * 1024ULL * 1024ULL)) * 10 / (1024ULL * 1024ULL * 1024ULL);
+        ULONGLONG availGB = ms.ullAvailPhys / (1024ULL * 1024ULL * 1024ULL);
+        wchar_t buf[128];
+        swprintf_s(buf, 128, L"%llu.%llu GB total (%llu GB available, %lu%% in use)",
+            totalGB, totalMBRem, availGB, ms.dwMemoryLoad);
+        g_sysInfoLines.push_back({ L"RAM", buf });
+    }
+
+    // OS
+    {
+        HKEY hKey;
+        wchar_t productName[256] = L"Windows";
+        wchar_t buildNum[64] = L"";
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ, &hKey) == ERROR_SUCCESS)
+        {
+            DWORD sz = sizeof(productName);
+            RegQueryValueEx(hKey, L"ProductName", nullptr, nullptr, (BYTE*)productName, &sz);
+            sz = sizeof(buildNum);
+            RegQueryValueEx(hKey, L"CurrentBuild", nullptr, nullptr, (BYTE*)buildNum, &sz);
+            RegCloseKey(hKey);
+        }
+        std::wstring osStr = productName;
+        osStr += L" (Build ";
+        osStr += buildNum;
+        osStr += L")";
+        g_sysInfoLines.push_back({ L"OS", osStr });
+    }
+
+    // Disks
+    {
+        DWORD driveMask = GetLogicalDrives();
+        for (int i = 0; i < 26; i++)
+        {
+            if (!(driveMask & (1 << i))) continue;
+            wchar_t root[] = { (wchar_t)(L'A' + i), L':', L'\\', 0 };
+            UINT dt = GetDriveType(root);
+            if (dt != DRIVE_FIXED && dt != DRIVE_REMOVABLE) continue;
+
+            ULARGE_INTEGER totalBytes = {}, freeBytes = {};
+            if (!GetDiskFreeSpaceEx(root, nullptr, &totalBytes, &freeBytes)) continue;
+
+            ULONGLONG totalGB = totalBytes.QuadPart / (1024ULL * 1024ULL * 1024ULL);
+            ULONGLONG freeGB = freeBytes.QuadPart / (1024ULL * 1024ULL * 1024ULL);
+
+            wchar_t label[64];
+            wsprintfW(label, L"Disk %c:", (wchar_t)(L'A' + i));
+            wchar_t val[128];
+            swprintf_s(val, 128, L"%llu GB free / %llu GB total", freeGB, totalGB);
+            g_sysInfoLines.push_back({ label, val });
+        }
+    }
+
+    // Uptime
+    {
+        ULONGLONG ms = GetTickCount64();
+        ULONGLONG secs = ms / 1000;
+        ULONGLONG mins = secs / 60; secs %= 60;
+        ULONGLONG hours = mins / 60; mins %= 60;
+        ULONGLONG days = hours / 24; hours %= 24;
+        wchar_t buf[128];
+        swprintf_s(buf, 128, L"%llu days, %llu hours, %llu minutes", days, hours, mins);
+        g_sysInfoLines.push_back({ L"Uptime", buf });
+    }
+}
+
+// ============================================================
+// Uninstaller enumeration
+// ============================================================
+void EnumerateUninstallItems()
+{
+    g_uninstallItems.clear();
+
+    auto readKey = [](HKEY hive, const wchar_t* path)
+    {
+        HKEY hKey;
+        if (RegOpenKeyEx(hive, path, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hKey) != ERROR_SUCCESS)
+            return;
+
+        wchar_t subKeyName[256];
+        DWORD index = 0;
+        DWORD nameLen;
+
+        while (true)
+        {
+            nameLen = 256;
+            if (RegEnumKeyEx(hKey, index, subKeyName, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+
+            HKEY hSubKey;
+            if (RegOpenKeyEx(hKey, subKeyName, 0, KEY_READ, &hSubKey) == ERROR_SUCCESS)
+            {
+                // Check SystemComponent
+                DWORD sysComp = 0;
+                DWORD sz = sizeof(sysComp);
+                RegQueryValueEx(hSubKey, L"SystemComponent", nullptr, nullptr, (BYTE*)&sysComp, &sz);
+
+                wchar_t displayName[512] = {};
+                sz = sizeof(displayName);
+                RegQueryValueEx(hSubKey, L"DisplayName", nullptr, nullptr, (BYTE*)displayName, &sz);
+
+                if (displayName[0] != 0 && sysComp != 1)
+                {
+                    UninstallItem ui;
+                    ui.displayName = displayName;
+                    ui.selected = false;
+                    ui.estimatedSize = 0;
+
+                    wchar_t buf[512] = {};
+                    sz = sizeof(buf);
+                    if (RegQueryValueEx(hSubKey, L"Publisher", nullptr, nullptr, (BYTE*)buf, &sz) == ERROR_SUCCESS)
+                        ui.publisher = buf;
+
+                    sz = sizeof(buf);
+                    if (RegQueryValueEx(hSubKey, L"DisplayVersion", nullptr, nullptr, (BYTE*)buf, &sz) == ERROR_SUCCESS)
+                        ui.version = buf;
+
+                    sz = sizeof(ui.estimatedSize);
+                    RegQueryValueEx(hSubKey, L"EstimatedSize", nullptr, nullptr, (BYTE*)&ui.estimatedSize, &sz);
+
+                    sz = sizeof(buf);
+                    if (RegQueryValueEx(hSubKey, L"UninstallString", nullptr, nullptr, (BYTE*)buf, &sz) == ERROR_SUCCESS)
+                        ui.uninstallString = buf;
+
+                    if (!ui.uninstallString.empty())
+                        g_uninstallItems.push_back(ui);
+                }
+                RegCloseKey(hSubKey);
+            }
+            index++;
+        }
+        RegCloseKey(hKey);
+    };
+
+    readKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+    readKey(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
+
+    // Remove duplicates by display name
+    for (size_t i = 0; i < g_uninstallItems.size(); i++)
+    {
+        for (size_t j = i + 1; j < g_uninstallItems.size(); )
+        {
+            if (_wcsicmp(g_uninstallItems[i].displayName.c_str(), g_uninstallItems[j].displayName.c_str()) == 0)
+                g_uninstallItems.erase(g_uninstallItems.begin() + j);
+            else
+                j++;
+        }
+    }
+
+    // Sort alphabetically
+    std::sort(g_uninstallItems.begin(), g_uninstallItems.end(),
+        [](const UninstallItem& a, const UninstallItem& b) {
+            return _wcsicmp(a.displayName.c_str(), b.displayName.c_str()) < 0;
+        });
+
+    g_uninstallItemRects.resize(g_uninstallItems.size());
+    g_uninstallItemBtns.resize(g_uninstallItems.size());
+    for (auto& b : g_uninstallItemBtns) b = {};
 }
 
 std::wstring FormatBytes(ULONGLONG bytes)
@@ -1008,6 +1610,466 @@ void DrawPartitionsPanel(HDC hdc, RECT clientRect)
     }
 }
 
+// ============================================================
+// Draw: Startup Manager
+// ============================================================
+void DrawStartupPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Startup Manager", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Click an item to toggle enable/disable. Green = enabled, Red = disabled.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    int btnWidth = contentRight - contentLeft;
+    int btnHeight = 36;
+    int spacing = 4;
+    int startY = 108 - g_startupScrollY;
+
+    // Create clipping region for list area
+    HRGN clipRgn = CreateRectRgn(contentLeft, 108, contentRight, clientRect.bottom - 55);
+    SelectClipRgn(hdc, clipRgn);
+
+    for (size_t i = 0; i < g_startupItems.size(); i++)
+    {
+        RECT btnRect;
+        btnRect.left = contentLeft;
+        btnRect.right = contentRight;
+        btnRect.top = startY + (int)i * (btnHeight + spacing);
+        btnRect.bottom = btnRect.top + btnHeight;
+        g_startupItemRects[i] = btnRect;
+
+        if (btnRect.bottom < 108 || btnRect.top > clientRect.bottom - 55)
+            continue;
+
+        COLORREF bgColor = Colors::FrameBg;
+        COLORREF borderColor = Colors::Border;
+        if (g_startupItemBtns[i].pressed)
+            bgColor = Colors::AccentPress;
+        else if (g_startupItemBtns[i].hovered)
+            bgColor = Colors::TabHover;
+
+        HBRUSH bgBrush = CreateSolidBrush(bgColor);
+        HPEN bPen = CreatePen(PS_SOLID, 1, borderColor);
+        HBRUSH oldBr = (HBRUSH)SelectObject(hdc, bgBrush);
+        HPEN oldPn = (HPEN)SelectObject(hdc, bPen);
+        RoundRect(hdc, btnRect.left, btnRect.top, btnRect.right, btnRect.bottom, 6, 6);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPn);
+        DeleteObject(bgBrush);
+        DeleteObject(bPen);
+
+        // Name on left
+        COLORREF nameColor = g_startupItems[i].enabled ? RGB(80, 200, 80) : RGB(200, 80, 80);
+        SetTextColor(hdc, nameColor);
+        SelectObject(hdc, g_tabFont);
+        RECT nameRect = btnRect;
+        nameRect.left += 12;
+        nameRect.right -= 120;
+        DrawText(hdc, g_startupItems[i].name.c_str(), -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        // Source on right
+        SetTextColor(hdc, Colors::TextDim);
+        SelectObject(hdc, g_smallFont);
+        RECT srcRect = btnRect;
+        srcRect.right -= 12;
+        DrawText(hdc, g_startupItems[i].source.c_str(), -1, &srcRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clipRgn);
+
+    // Buttons at bottom
+    int btnY = clientRect.bottom - 48;
+    int smallBtnW = 110;
+    int smallBtnH = 34;
+    int gap = 10;
+    int totalW = smallBtnW * 3 + gap * 2;
+    int bx = contentCenterX - totalW / 2;
+
+    g_startupDisableAllBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_startupDisableAllBtnRect, L"Disable All", g_startupDisableAllBtn, true);
+
+    bx += smallBtnW + gap;
+    g_startupEnableAllBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_startupEnableAllBtnRect, L"Enable All", g_startupEnableAllBtn);
+
+    bx += smallBtnW + gap;
+    g_startupRefreshBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_startupRefreshBtnRect, L"Refresh", g_startupRefreshBtn);
+
+    SelectObject(hdc, oldFont);
+}
+
+// ============================================================
+// Draw: Debloater
+// ============================================================
+void DrawDebloaterPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Debloater", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Select bloatware to remove. Only installed apps are shown.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    // Build visible list of installed items
+    std::vector<int> visibleIndices;
+    for (int i = 0; i < (int)g_bloatItems.size(); i++)
+        if (g_bloatItems[i].installed) visibleIndices.push_back(i);
+
+    int itemW = (contentRight - contentLeft - 10) / 2;
+    int itemH = 32;
+    int spacing = 4;
+    int startY = 108 - g_debloaterScrollY;
+
+    HRGN clipRgn = CreateRectRgn(contentLeft, 108, contentRight, clientRect.bottom - 55);
+    SelectClipRgn(hdc, clipRgn);
+
+    for (size_t vi = 0; vi < visibleIndices.size(); vi++)
+    {
+        int idx = visibleIndices[vi];
+        int col = (int)vi % 2;
+        int row = (int)vi / 2;
+
+        RECT itemRect;
+        itemRect.left = contentLeft + col * (itemW + 10);
+        itemRect.right = itemRect.left + itemW;
+        itemRect.top = startY + row * (itemH + spacing);
+        itemRect.bottom = itemRect.top + itemH;
+
+        if (vi < g_bloatItemRects.size())
+            g_bloatItemRects[vi] = itemRect;
+
+        if (itemRect.bottom < 108 || itemRect.top > clientRect.bottom - 55)
+            continue;
+
+        COLORREF bgColor = Colors::FrameBg;
+        if (vi < g_bloatItemBtns.size())
+        {
+            if (g_bloatItemBtns[vi].pressed) bgColor = Colors::AccentPress;
+            else if (g_bloatItemBtns[vi].hovered) bgColor = Colors::TabHover;
+        }
+
+        HBRUSH bgBrush = CreateSolidBrush(bgColor);
+        HPEN bPen = CreatePen(PS_SOLID, 1, Colors::Border);
+        HBRUSH oldBr = (HBRUSH)SelectObject(hdc, bgBrush);
+        HPEN oldPn2 = (HPEN)SelectObject(hdc, bPen);
+        RoundRect(hdc, itemRect.left, itemRect.top, itemRect.right, itemRect.bottom, 6, 6);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPn2);
+        DeleteObject(bgBrush);
+        DeleteObject(bPen);
+
+        // Checkbox
+        int cbX = itemRect.left + 8;
+        int cbY = itemRect.top + (itemH - 14) / 2;
+        RECT cbRect = { cbX, cbY, cbX + 14, cbY + 14 };
+        if (g_bloatItems[idx].selected)
+        {
+            HBRUSH cbBrush = CreateSolidBrush(Colors::Accent);
+            FillRect(hdc, &cbRect, cbBrush);
+            DeleteObject(cbBrush);
+        }
+        else
+        {
+            HBRUSH cbBrush = CreateSolidBrush(Colors::FrameBg);
+            FillRect(hdc, &cbRect, cbBrush);
+            DeleteObject(cbBrush);
+            HPEN cbPen = CreatePen(PS_SOLID, 1, Colors::Border);
+            HPEN oldCbPen = (HPEN)SelectObject(hdc, cbPen);
+            HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+            HBRUSH oldCbBr = (HBRUSH)SelectObject(hdc, nullBr);
+            Rectangle(hdc, cbRect.left, cbRect.top, cbRect.right, cbRect.bottom);
+            SelectObject(hdc, oldCbPen);
+            SelectObject(hdc, oldCbBr);
+            DeleteObject(cbPen);
+        }
+
+        // Display name
+        SetTextColor(hdc, Colors::Text);
+        SelectObject(hdc, g_tabFont);
+        RECT nameRect = itemRect;
+        nameRect.left += 28;
+        nameRect.right -= 4;
+        DrawText(hdc, g_bloatItems[idx].displayName.c_str(), -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clipRgn);
+
+    // Buttons at bottom
+    int btnY = clientRect.bottom - 48;
+    int smallBtnW = 120;
+    int smallBtnH = 34;
+    int gap = 10;
+    int totalW = smallBtnW * 3 + gap * 2;
+    int bx = contentCenterX - totalW / 2;
+
+    g_bloatSelectAllBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_bloatSelectAllBtnRect, L"Select All", g_bloatSelectAllBtn);
+
+    bx += smallBtnW + gap;
+    g_bloatDeselectAllBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_bloatDeselectAllBtnRect, L"Deselect All", g_bloatDeselectAllBtn);
+
+    bx += smallBtnW + gap;
+    g_bloatRemoveBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_bloatRemoveBtnRect, L"Remove", g_bloatRemoveBtn, true);
+
+    SelectObject(hdc, oldFont);
+}
+
+// ============================================================
+// Draw: System Info
+// ============================================================
+void DrawSysInfoPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"System Info", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Hardware and software information for this system.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    int lineHeight = 32;
+    int startY = 110 - g_sysInfoScrollY;
+
+    HRGN clipRgn = CreateRectRgn(contentLeft, 108, contentRight, clientRect.bottom - 55);
+    SelectClipRgn(hdc, clipRgn);
+
+    for (size_t i = 0; i < g_sysInfoLines.size(); i++)
+    {
+        int y = startY + (int)i * lineHeight;
+
+        if (y + lineHeight < 108 || y > clientRect.bottom - 55)
+            continue;
+
+        // Background stripe
+        if (i % 2 == 0)
+        {
+            RECT stripe = { contentLeft, y, contentRight, y + lineHeight };
+            HBRUSH stripeBrush = CreateSolidBrush(Colors::FrameBg);
+            FillRect(hdc, &stripe, stripeBrush);
+            DeleteObject(stripeBrush);
+        }
+
+        // Label
+        SetTextColor(hdc, Colors::Accent);
+        SelectObject(hdc, g_buttonFont);
+        RECT labelRect = { contentLeft + 12, y, contentLeft + 120, y + lineHeight };
+        DrawText(hdc, g_sysInfoLines[i].label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // Value
+        SetTextColor(hdc, Colors::Text);
+        SelectObject(hdc, g_tabFont);
+        RECT valRect = { contentLeft + 120, y, contentRight - 12, y + lineHeight };
+        DrawText(hdc, g_sysInfoLines[i].value.c_str(), -1, &valRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clipRgn);
+
+    // Buttons at bottom
+    int btnY = clientRect.bottom - 48;
+    int smallBtnW = 140;
+    int smallBtnH = 34;
+    int gap = 10;
+    int totalW = smallBtnW * 2 + gap;
+    int bx = contentCenterX - totalW / 2;
+
+    g_sysInfoRefreshBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_sysInfoRefreshBtnRect, L"Refresh", g_sysInfoRefreshBtn);
+
+    bx += smallBtnW + gap;
+    g_sysInfoCopyBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_sysInfoCopyBtnRect, L"Copy to Clipboard", g_sysInfoCopyBtn);
+
+    SelectObject(hdc, oldFont);
+}
+
+// ============================================================
+// Draw: Uninstaller
+// ============================================================
+void DrawUninstallerPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Uninstaller", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Select programs to uninstall. Click checkboxes to select, then uninstall.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    int itemH = 38;
+    int spacing = 4;
+    int startY = 108 - g_uninstallScrollY;
+
+    HRGN clipRgn = CreateRectRgn(contentLeft, 108, contentRight, clientRect.bottom - 55);
+    SelectClipRgn(hdc, clipRgn);
+
+    for (size_t i = 0; i < g_uninstallItems.size(); i++)
+    {
+        RECT itemRect;
+        itemRect.left = contentLeft;
+        itemRect.right = contentRight;
+        itemRect.top = startY + (int)i * (itemH + spacing);
+        itemRect.bottom = itemRect.top + itemH;
+        g_uninstallItemRects[i] = itemRect;
+
+        if (itemRect.bottom < 108 || itemRect.top > clientRect.bottom - 55)
+            continue;
+
+        COLORREF bgColor = Colors::FrameBg;
+        if (g_uninstallItemBtns[i].pressed) bgColor = Colors::AccentPress;
+        else if (g_uninstallItemBtns[i].hovered) bgColor = Colors::TabHover;
+
+        HBRUSH bgBrush = CreateSolidBrush(bgColor);
+        HPEN bPen = CreatePen(PS_SOLID, 1, Colors::Border);
+        HBRUSH oldBr = (HBRUSH)SelectObject(hdc, bgBrush);
+        HPEN oldPn = (HPEN)SelectObject(hdc, bPen);
+        RoundRect(hdc, itemRect.left, itemRect.top, itemRect.right, itemRect.bottom, 6, 6);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPn);
+        DeleteObject(bgBrush);
+        DeleteObject(bPen);
+
+        // Checkbox
+        int cbX = itemRect.left + 8;
+        int cbY = itemRect.top + (itemH - 14) / 2;
+        RECT cbRect = { cbX, cbY, cbX + 14, cbY + 14 };
+        if (g_uninstallItems[i].selected)
+        {
+            HBRUSH cbBrush = CreateSolidBrush(Colors::Accent);
+            FillRect(hdc, &cbRect, cbBrush);
+            DeleteObject(cbBrush);
+        }
+        else
+        {
+            HBRUSH cbBrush = CreateSolidBrush(Colors::FrameBg);
+            FillRect(hdc, &cbRect, cbBrush);
+            DeleteObject(cbBrush);
+            HPEN cbPen = CreatePen(PS_SOLID, 1, Colors::Border);
+            HPEN oldCbPen = (HPEN)SelectObject(hdc, cbPen);
+            HBRUSH nullBr = (HBRUSH)GetStockObject(NULL_BRUSH);
+            HBRUSH oldCbBr = (HBRUSH)SelectObject(hdc, nullBr);
+            Rectangle(hdc, cbRect.left, cbRect.top, cbRect.right, cbRect.bottom);
+            SelectObject(hdc, oldCbPen);
+            SelectObject(hdc, oldCbBr);
+            DeleteObject(cbPen);
+        }
+
+        // Display name
+        SetTextColor(hdc, Colors::Text);
+        SelectObject(hdc, g_tabFont);
+        RECT nameRect = itemRect;
+        nameRect.left += 28;
+        nameRect.right -= 160;
+        DrawText(hdc, g_uninstallItems[i].displayName.c_str(), -1, &nameRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        // Publisher + version on right
+        SetTextColor(hdc, Colors::TextDim);
+        SelectObject(hdc, g_smallFont);
+        std::wstring info = g_uninstallItems[i].publisher;
+        if (!g_uninstallItems[i].version.empty())
+        {
+            if (!info.empty()) info += L"  ";
+            info += L"v" + g_uninstallItems[i].version;
+        }
+        RECT infoRect = itemRect;
+        infoRect.right -= 12;
+        DrawText(hdc, info.c_str(), -1, &infoRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clipRgn);
+
+    // Buttons at bottom
+    int btnY = clientRect.bottom - 48;
+    int smallBtnW = 140;
+    int smallBtnH = 34;
+    int gap = 10;
+    int totalW = smallBtnW * 2 + gap + 100 + gap;
+    int bx = contentCenterX - totalW / 2;
+
+    g_uninstallAllBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_uninstallAllBtnRect, L"Uninstall Selected", g_uninstallAllBtn, true);
+
+    bx += smallBtnW + gap;
+    g_uninstallBtnRect = { bx, btnY, bx + 100, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_uninstallBtnRect, L"Uninstall", g_uninstallBtn, true);
+
+    bx += 100 + gap;
+    g_uninstallRefreshBtnRect = { bx, btnY, bx + smallBtnW, btnY + smallBtnH };
+    DrawRoundedButton(hdc, g_uninstallRefreshBtnRect, L"Refresh", g_uninstallRefreshBtn);
+
+    SelectObject(hdc, oldFont);
+}
+
 void DrawContentPanel(HDC hdc, RECT clientRect)
 {
     if (g_activeTab == TAB_CLEANER)
@@ -1030,6 +2092,43 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
     else if (g_activeTab == TAB_RESTORE)
     {
         DrawRestorePanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_STARTUP)
+    {
+        if (!g_startupLoaded)
+        {
+            EnumerateStartupItems();
+            g_startupLoaded = true;
+        }
+        DrawStartupPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_DEBLOATER)
+    {
+        if (!g_debloaterLoaded)
+        {
+            InitBloatwareList();
+            CheckInstalledBloatware();
+            g_debloaterLoaded = true;
+        }
+        DrawDebloaterPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_SYSINFO)
+    {
+        if (!g_sysInfoLoaded)
+        {
+            GatherSystemInfo();
+            g_sysInfoLoaded = true;
+        }
+        DrawSysInfoPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_UNINSTALLER)
+    {
+        if (!g_uninstallLoaded)
+        {
+            EnumerateUninstallItems();
+            g_uninstallLoaded = true;
+        }
+        DrawUninstallerPanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_OTHERS)
     {
@@ -1517,7 +2616,7 @@ std::wstring CleanGameFolders()
 // Restore functions
 // ============================================================
 
-bool RunHiddenCommand(const wchar_t* cmd, DWORD timeoutMs = 30000)
+bool RunHiddenCommand(const wchar_t* cmd, DWORD timeoutMs)
 {
     STARTUPINFO si = {};
     si.cb = sizeof(si);
@@ -2623,6 +3722,58 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     InvalidateRect(hwnd, &g_optimBtnRects[i], FALSE);
             }
         }
+        else if (g_activeTab == TAB_STARTUP)
+        {
+            for (size_t i = 0; i < g_startupItems.size(); i++)
+            {
+                bool w = g_startupItemBtns[i].hovered;
+                g_startupItemBtns[i].hovered = PtInRect(&g_startupItemRects[i], pt);
+                if (w != g_startupItemBtns[i].hovered) InvalidateRect(hwnd, &g_startupItemRects[i], FALSE);
+            }
+            bool w1 = g_startupDisableAllBtn.hovered; g_startupDisableAllBtn.hovered = PtInRect(&g_startupDisableAllBtnRect, pt);
+            if (w1 != g_startupDisableAllBtn.hovered) InvalidateRect(hwnd, &g_startupDisableAllBtnRect, FALSE);
+            bool w2 = g_startupEnableAllBtn.hovered; g_startupEnableAllBtn.hovered = PtInRect(&g_startupEnableAllBtnRect, pt);
+            if (w2 != g_startupEnableAllBtn.hovered) InvalidateRect(hwnd, &g_startupEnableAllBtnRect, FALSE);
+            bool w3 = g_startupRefreshBtn.hovered; g_startupRefreshBtn.hovered = PtInRect(&g_startupRefreshBtnRect, pt);
+            if (w3 != g_startupRefreshBtn.hovered) InvalidateRect(hwnd, &g_startupRefreshBtnRect, FALSE);
+        }
+        else if (g_activeTab == TAB_DEBLOATER)
+        {
+            for (size_t i = 0; i < g_bloatItemBtns.size(); i++)
+            {
+                bool w = g_bloatItemBtns[i].hovered;
+                g_bloatItemBtns[i].hovered = PtInRect(&g_bloatItemRects[i], pt);
+                if (w != g_bloatItemBtns[i].hovered) InvalidateRect(hwnd, &g_bloatItemRects[i], FALSE);
+            }
+            bool w1 = g_bloatSelectAllBtn.hovered; g_bloatSelectAllBtn.hovered = PtInRect(&g_bloatSelectAllBtnRect, pt);
+            if (w1 != g_bloatSelectAllBtn.hovered) InvalidateRect(hwnd, &g_bloatSelectAllBtnRect, FALSE);
+            bool w2 = g_bloatDeselectAllBtn.hovered; g_bloatDeselectAllBtn.hovered = PtInRect(&g_bloatDeselectAllBtnRect, pt);
+            if (w2 != g_bloatDeselectAllBtn.hovered) InvalidateRect(hwnd, &g_bloatDeselectAllBtnRect, FALSE);
+            bool w3 = g_bloatRemoveBtn.hovered; g_bloatRemoveBtn.hovered = PtInRect(&g_bloatRemoveBtnRect, pt);
+            if (w3 != g_bloatRemoveBtn.hovered) InvalidateRect(hwnd, &g_bloatRemoveBtnRect, FALSE);
+        }
+        else if (g_activeTab == TAB_SYSINFO)
+        {
+            bool w1 = g_sysInfoRefreshBtn.hovered; g_sysInfoRefreshBtn.hovered = PtInRect(&g_sysInfoRefreshBtnRect, pt);
+            if (w1 != g_sysInfoRefreshBtn.hovered) InvalidateRect(hwnd, &g_sysInfoRefreshBtnRect, FALSE);
+            bool w2 = g_sysInfoCopyBtn.hovered; g_sysInfoCopyBtn.hovered = PtInRect(&g_sysInfoCopyBtnRect, pt);
+            if (w2 != g_sysInfoCopyBtn.hovered) InvalidateRect(hwnd, &g_sysInfoCopyBtnRect, FALSE);
+        }
+        else if (g_activeTab == TAB_UNINSTALLER)
+        {
+            for (size_t i = 0; i < g_uninstallItems.size(); i++)
+            {
+                bool w = g_uninstallItemBtns[i].hovered;
+                g_uninstallItemBtns[i].hovered = PtInRect(&g_uninstallItemRects[i], pt);
+                if (w != g_uninstallItemBtns[i].hovered) InvalidateRect(hwnd, &g_uninstallItemRects[i], FALSE);
+            }
+            bool w1 = g_uninstallBtn.hovered; g_uninstallBtn.hovered = PtInRect(&g_uninstallBtnRect, pt);
+            if (w1 != g_uninstallBtn.hovered) InvalidateRect(hwnd, &g_uninstallBtnRect, FALSE);
+            bool w2 = g_uninstallAllBtn.hovered; g_uninstallAllBtn.hovered = PtInRect(&g_uninstallAllBtnRect, pt);
+            if (w2 != g_uninstallAllBtn.hovered) InvalidateRect(hwnd, &g_uninstallAllBtnRect, FALSE);
+            bool w3 = g_uninstallRefreshBtn.hovered; g_uninstallRefreshBtn.hovered = PtInRect(&g_uninstallRefreshBtnRect, pt);
+            if (w3 != g_uninstallRefreshBtn.hovered) InvalidateRect(hwnd, &g_uninstallRefreshBtnRect, FALSE);
+        }
         else if (g_activeTab == TAB_OTHERS)
         {
             if (g_showRegistrySubView)
@@ -2685,6 +3836,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         g_regResetBtn.hovered = false;
         g_regCleanBtn.hovered = false;
         g_regBackBtn.hovered = false;
+        // Startup
+        for (auto& b : g_startupItemBtns) b.hovered = false;
+        g_startupDisableAllBtn.hovered = false;
+        g_startupEnableAllBtn.hovered = false;
+        g_startupRefreshBtn.hovered = false;
+        // Debloater
+        for (auto& b : g_bloatItemBtns) b.hovered = false;
+        g_bloatSelectAllBtn.hovered = false;
+        g_bloatDeselectAllBtn.hovered = false;
+        g_bloatRemoveBtn.hovered = false;
+        // SysInfo
+        g_sysInfoRefreshBtn.hovered = false;
+        g_sysInfoCopyBtn.hovered = false;
+        // Uninstaller
+        for (auto& b : g_uninstallItemBtns) b.hovered = false;
+        g_uninstallBtn.hovered = false;
+        g_uninstallAllBtn.hovered = false;
+        g_uninstallRefreshBtn.hovered = false;
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -2707,6 +3876,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_showRestoreLoadView = false;
                 g_cleanerScrollY = 0;
                 g_partScrollY = 0;
+                g_startupScrollY = 0;
+                g_debloaterScrollY = 0;
+                g_sysInfoScrollY = 0;
+                g_uninstallScrollY = 0;
                 if (i == TAB_CLEANER)
                 {
                     EnumerateDrives();
@@ -2831,6 +4004,56 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     }
                 }
             }
+        }
+
+        if (g_activeTab == TAB_STARTUP)
+        {
+            for (size_t i = 0; i < g_startupItems.size(); i++)
+            {
+                if (PtInRect(&g_startupItemRects[i], pt))
+                { g_startupItemBtns[i].pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_startupItemRects[i], FALSE); return 0; }
+            }
+            if (PtInRect(&g_startupDisableAllBtnRect, pt))
+            { g_startupDisableAllBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_startupDisableAllBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_startupEnableAllBtnRect, pt))
+            { g_startupEnableAllBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_startupEnableAllBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_startupRefreshBtnRect, pt))
+            { g_startupRefreshBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_startupRefreshBtnRect, FALSE); return 0; }
+        }
+        else if (g_activeTab == TAB_DEBLOATER)
+        {
+            for (size_t i = 0; i < g_bloatItemBtns.size(); i++)
+            {
+                if (PtInRect(&g_bloatItemRects[i], pt))
+                { g_bloatItemBtns[i].pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_bloatItemRects[i], FALSE); return 0; }
+            }
+            if (PtInRect(&g_bloatSelectAllBtnRect, pt))
+            { g_bloatSelectAllBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_bloatSelectAllBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_bloatDeselectAllBtnRect, pt))
+            { g_bloatDeselectAllBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_bloatDeselectAllBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_bloatRemoveBtnRect, pt))
+            { g_bloatRemoveBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_bloatRemoveBtnRect, FALSE); return 0; }
+        }
+        else if (g_activeTab == TAB_SYSINFO)
+        {
+            if (PtInRect(&g_sysInfoRefreshBtnRect, pt))
+            { g_sysInfoRefreshBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_sysInfoRefreshBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_sysInfoCopyBtnRect, pt))
+            { g_sysInfoCopyBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_sysInfoCopyBtnRect, FALSE); return 0; }
+        }
+        else if (g_activeTab == TAB_UNINSTALLER)
+        {
+            for (size_t i = 0; i < g_uninstallItems.size(); i++)
+            {
+                if (PtInRect(&g_uninstallItemRects[i], pt))
+                { g_uninstallItemBtns[i].pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_uninstallItemRects[i], FALSE); return 0; }
+            }
+            if (PtInRect(&g_uninstallBtnRect, pt))
+            { g_uninstallBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_uninstallBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_uninstallAllBtnRect, pt))
+            { g_uninstallAllBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_uninstallAllBtnRect, FALSE); return 0; }
+            if (PtInRect(&g_uninstallRefreshBtnRect, pt))
+            { g_uninstallRefreshBtn.pressed = true; SetCapture(hwnd); InvalidateRect(hwnd, &g_uninstallRefreshBtnRect, FALSE); return 0; }
         }
 
         // Action button press (Cleaner + Partitions merge view)
@@ -3186,6 +4409,256 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
         }
 
+        // Startup tab
+        if (g_activeTab == TAB_STARTUP)
+        {
+            for (size_t i = 0; i < g_startupItems.size(); i++)
+            {
+                bool was = g_startupItemBtns[i].pressed; g_startupItemBtns[i].pressed = false;
+                if (was && PtInRect(&g_startupItemRects[i], pt))
+                {
+                    ToggleStartupItem((int)i);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            bool wasDA = g_startupDisableAllBtn.pressed; g_startupDisableAllBtn.pressed = false;
+            if (wasDA && PtInRect(&g_startupDisableAllBtnRect, pt))
+            {
+                for (size_t i = 0; i < g_startupItems.size(); i++)
+                    if (g_startupItems[i].enabled) ToggleStartupItem((int)i);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            bool wasEA = g_startupEnableAllBtn.pressed; g_startupEnableAllBtn.pressed = false;
+            if (wasEA && PtInRect(&g_startupEnableAllBtnRect, pt))
+            {
+                for (size_t i = 0; i < g_startupItems.size(); i++)
+                    if (!g_startupItems[i].enabled) ToggleStartupItem((int)i);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            bool wasRef = g_startupRefreshBtn.pressed; g_startupRefreshBtn.pressed = false;
+            if (wasRef && PtInRect(&g_startupRefreshBtnRect, pt))
+            {
+                EnumerateStartupItems();
+                g_startupScrollY = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
+        // Debloater tab
+        if (g_activeTab == TAB_DEBLOATER)
+        {
+            // Build visible indices
+            std::vector<int> visIdx;
+            for (int i = 0; i < (int)g_bloatItems.size(); i++)
+                if (g_bloatItems[i].installed) visIdx.push_back(i);
+
+            for (size_t vi = 0; vi < g_bloatItemBtns.size(); vi++)
+            {
+                bool was = g_bloatItemBtns[vi].pressed; g_bloatItemBtns[vi].pressed = false;
+                if (was && vi < g_bloatItemRects.size() && PtInRect(&g_bloatItemRects[vi], pt))
+                {
+                    if (vi < visIdx.size())
+                    {
+                        g_bloatItems[visIdx[vi]].selected = !g_bloatItems[visIdx[vi]].selected;
+                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            bool wasSA = g_bloatSelectAllBtn.pressed; g_bloatSelectAllBtn.pressed = false;
+            if (wasSA && PtInRect(&g_bloatSelectAllBtnRect, pt))
+            {
+                for (auto& bi : g_bloatItems) if (bi.installed) bi.selected = true;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            bool wasDS = g_bloatDeselectAllBtn.pressed; g_bloatDeselectAllBtn.pressed = false;
+            if (wasDS && PtInRect(&g_bloatDeselectAllBtnRect, pt))
+            {
+                for (auto& bi : g_bloatItems) bi.selected = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            bool wasRem = g_bloatRemoveBtn.pressed; g_bloatRemoveBtn.pressed = false;
+            if (wasRem && PtInRect(&g_bloatRemoveBtnRect, pt))
+            {
+                std::wstring list;
+                int count = 0;
+                for (auto& bi : g_bloatItems)
+                {
+                    if (bi.installed && bi.selected)
+                    {
+                        list += L"  - " + bi.displayName + L"\n";
+                        count++;
+                    }
+                }
+                if (count == 0)
+                {
+                    MessageBox(hwnd, L"No apps selected.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                else
+                {
+                    std::wstring msg = L"Remove these " + std::to_wstring(count) + L" app(s)?\n\n" + list;
+                    if (MessageBox(hwnd, msg.c_str(), L"ECLYPSE - Confirm", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+                    {
+                        for (auto& bi : g_bloatItems)
+                        {
+                            if (bi.installed && bi.selected)
+                            {
+                                std::wstring cmd = L"powershell -Command \"Get-AppxPackage *" + bi.packageName + L"* | Remove-AppxPackage\"";
+                                RunHiddenCommand(cmd.c_str(), 30000);
+                                bi.installed = false;
+                                bi.selected = false;
+                            }
+                        }
+                        // Rebuild visible list
+                        int vc = 0;
+                        for (auto& bi : g_bloatItems) if (bi.installed) vc++;
+                        g_bloatItemRects.resize(vc);
+                        g_bloatItemBtns.resize(vc);
+                        for (auto& b : g_bloatItemBtns) b = {};
+                        MessageBox(hwnd, L"Selected apps removed.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
+        // SysInfo tab
+        if (g_activeTab == TAB_SYSINFO)
+        {
+            bool wasRef = g_sysInfoRefreshBtn.pressed; g_sysInfoRefreshBtn.pressed = false;
+            if (wasRef && PtInRect(&g_sysInfoRefreshBtnRect, pt))
+            {
+                GatherSystemInfo();
+                g_sysInfoScrollY = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            bool wasCopy = g_sysInfoCopyBtn.pressed; g_sysInfoCopyBtn.pressed = false;
+            if (wasCopy && PtInRect(&g_sysInfoCopyBtnRect, pt))
+            {
+                std::wstring text = L"ECLYPSE System Info\n====================\n";
+                for (auto& line : g_sysInfoLines)
+                {
+                    text += line.label + L": " + line.value + L"\n";
+                }
+                if (OpenClipboard(hwnd))
+                {
+                    EmptyClipboard();
+                    size_t sz = (text.size() + 1) * sizeof(wchar_t);
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sz);
+                    if (hMem)
+                    {
+                        wchar_t* dst = (wchar_t*)GlobalLock(hMem);
+                        wcscpy_s(dst, text.size() + 1, text.c_str());
+                        GlobalUnlock(hMem);
+                        SetClipboardData(CF_UNICODETEXT, hMem);
+                    }
+                    CloseClipboard();
+                    MessageBox(hwnd, L"System info copied to clipboard.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
+        // Uninstaller tab
+        if (g_activeTab == TAB_UNINSTALLER)
+        {
+            for (size_t i = 0; i < g_uninstallItems.size(); i++)
+            {
+                bool was = g_uninstallItemBtns[i].pressed; g_uninstallItemBtns[i].pressed = false;
+                if (was && PtInRect(&g_uninstallItemRects[i], pt))
+                {
+                    g_uninstallItems[i].selected = !g_uninstallItems[i].selected;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            // Single uninstall - find first selected
+            bool wasUn = g_uninstallBtn.pressed; g_uninstallBtn.pressed = false;
+            if (wasUn && PtInRect(&g_uninstallBtnRect, pt))
+            {
+                int selIdx = -1;
+                for (size_t i = 0; i < g_uninstallItems.size(); i++)
+                    if (g_uninstallItems[i].selected) { selIdx = (int)i; break; }
+                if (selIdx >= 0)
+                {
+                    std::wstring msg = L"Uninstall " + g_uninstallItems[selIdx].displayName + L"?";
+                    if (MessageBox(hwnd, msg.c_str(), L"ECLYPSE - Confirm", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                    {
+                        std::wstring cmd = g_uninstallItems[selIdx].uninstallString;
+                        RunHiddenCommand(cmd.c_str(), 60000);
+                        EnumerateUninstallItems();
+                        g_uninstallScrollY = 0;
+                    }
+                }
+                else
+                {
+                    MessageBox(hwnd, L"Please select a program first.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            // Uninstall all selected
+            bool wasAll = g_uninstallAllBtn.pressed; g_uninstallAllBtn.pressed = false;
+            if (wasAll && PtInRect(&g_uninstallAllBtnRect, pt))
+            {
+                std::wstring list;
+                int count = 0;
+                for (auto& ui : g_uninstallItems)
+                {
+                    if (ui.selected)
+                    {
+                        list += L"  - " + ui.displayName + L"\n";
+                        count++;
+                    }
+                }
+                if (count == 0)
+                {
+                    MessageBox(hwnd, L"No programs selected.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                else
+                {
+                    std::wstring msg = L"Uninstall these " + std::to_wstring(count) + L" program(s)?\n\n" + list;
+                    if (MessageBox(hwnd, msg.c_str(), L"ECLYPSE - Confirm", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+                    {
+                        for (auto& ui : g_uninstallItems)
+                        {
+                            if (ui.selected && !ui.uninstallString.empty())
+                            {
+                                RunHiddenCommand(ui.uninstallString.c_str(), 60000);
+                            }
+                        }
+                        EnumerateUninstallItems();
+                        g_uninstallScrollY = 0;
+                        MessageBox(hwnd, L"Uninstall commands executed.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            // Refresh
+            bool wasRefU = g_uninstallRefreshBtn.pressed; g_uninstallRefreshBtn.pressed = false;
+            if (wasRefU && PtInRect(&g_uninstallRefreshBtnRect, pt))
+            {
+                EnumerateUninstallItems();
+                g_uninstallScrollY = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
         // Action button release (Cleaner tab)
         {
             bool wasPressed = g_actionBtn.pressed;
@@ -3235,6 +4708,44 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (maxScroll < 0) maxScroll = 0;
             if (g_partScrollY < 0) g_partScrollY = 0;
             if (g_partScrollY > maxScroll) g_partScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_STARTUP)
+        {
+            g_startupScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_startupItems.size() * 40 - 300;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_startupScrollY < 0) g_startupScrollY = 0;
+            if (g_startupScrollY > maxScroll) g_startupScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_DEBLOATER)
+        {
+            g_debloaterScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int visCount = 0;
+            for (auto& bi : g_bloatItems) if (bi.installed) visCount++;
+            int maxScroll = (visCount / 2 + 1) * 36 - 300;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_debloaterScrollY < 0) g_debloaterScrollY = 0;
+            if (g_debloaterScrollY > maxScroll) g_debloaterScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_SYSINFO)
+        {
+            g_sysInfoScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_sysInfoLines.size() * 32 - 300;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_sysInfoScrollY < 0) g_sysInfoScrollY = 0;
+            if (g_sysInfoScrollY > maxScroll) g_sysInfoScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_UNINSTALLER)
+        {
+            g_uninstallScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_uninstallItems.size() * 42 - 300;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_uninstallScrollY < 0) g_uninstallScrollY = 0;
+            if (g_uninstallScrollY > maxScroll) g_uninstallScrollY = maxScroll;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
