@@ -3,11 +3,17 @@
 #include <winioctl.h>
 #include <ShlObj.h>
 #include <iphlpapi.h>
+#include <winhttp.h>
+#include <tlhelp32.h>
+#include <winternl.h>
+#include <intrin.h>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
+#include <ctime>
 #include <shlwapi.h>
 #include "resource.h"
 
@@ -17,6 +23,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // ECLYPSE color palette
 namespace Colors
@@ -4818,6 +4825,609 @@ void WipeDrive(HWND hwnd, wchar_t driveLetter)
     CreatePartitions(hwnd, diskNumber, diskSize, partSizeGB);
 }
 
+// =====================================================
+// KeyAuth integration (ported from MinecraftCheatDLL/Injector)
+// =====================================================
+
+// XOR string encryption — hides plaintext credentials from hex editors/strings
+static std::string XorDecrypt(const unsigned char* data, size_t len, unsigned char key)
+{
+    std::string out(len, 0);
+    for (size_t i = 0; i < len; i++) out[i] = data[i] ^ (key + (unsigned char)i);
+    return out;
+}
+
+// Encrypted KeyAuth credentials (not visible as plaintext in the binary)
+// "Eclypse" XOR'd with key 0xAB
+static const unsigned char enc_appname[] = { 0xEE,0xCF,0xC1,0xD7,0xDF,0xC3,0xD4 };
+// "gqhdGB286F" XOR'd with key 0xAB
+static const unsigned char enc_ownerid[] = { 0xCC,0xDD,0xC5,0xCA,0xE8,0xF2,0x83,0x8A,0x85,0xF2 };
+
+static std::string GetAppName() { return XorDecrypt(enc_appname, sizeof(enc_appname), 0xAB); }
+static std::string GetOwnerId() { return XorDecrypt(enc_ownerid, sizeof(enc_ownerid), 0xAB); }
+
+// Auth token — not a simple bool. Uses a magic value that's set by the actual auth flow.
+static volatile DWORD g_authToken1 = 0;
+static volatile DWORD g_authToken2 = 0;
+#define AUTH_MAGIC1 0xDEAD8C66
+#define AUTH_MAGIC2 0xCAFE1337
+
+static bool IsReallyAuthenticated()
+{
+    return (g_authToken1 == AUTH_MAGIC1) && (g_authToken2 == AUTH_MAGIC2);
+}
+
+// --- Anti-debug: multiple layered checks ---
+static bool DetectDebugger()
+{
+    if (IsDebuggerPresent()) return true;
+
+    BOOL remoteDbg = FALSE;
+    CheckRemoteDebuggerPresent(GetCurrentProcess(), &remoteDbg);
+    if (remoteDbg) return true;
+
+#ifdef _M_X64
+    PPEB pPeb = (PPEB)__readgsqword(0x60);
+#else
+    PPEB pPeb = (PPEB)__readfsdword(0x30);
+#endif
+    if (pPeb && pPeb->BeingDebugged) return true;
+
+    DWORD ntGlobalFlag = *(DWORD*)((BYTE*)pPeb + 0xBC);
+    if (ntGlobalFlag & 0x70) return true;
+
+    LARGE_INTEGER freq, t1, t2;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t1);
+    volatile int dummy = 0;
+    for (int i = 0; i < 1000; i++) dummy += i;
+    QueryPerformanceCounter(&t2);
+    double elapsed = (double)(t2.QuadPart - t1.QuadPart) / freq.QuadPart;
+    if (elapsed > 0.5) return true;
+
+    const char* badWindows[] = {
+        "x64dbg", "x32dbg", "OllyDbg", "IDA", "Ghidra", "Cheat Engine",
+        "dnSpy", "Process Hacker", "HxD", "Scylla", nullptr
+    };
+    for (int i = 0; badWindows[i]; i++) {
+        if (FindWindowA(nullptr, badWindows[i])) return true;
+    }
+
+    return false;
+}
+
+static bool DetectVM()
+{
+    int cpuInfo[4] = {};
+    __cpuid(cpuInfo, 0x40000000);
+    char vendor[13] = {};
+    memcpy(vendor, &cpuInfo[1], 4);
+    memcpy(vendor + 4, &cpuInfo[2], 4);
+    memcpy(vendor + 8, &cpuInfo[3], 4);
+    const char* vmVendors[] = {
+        "VMwareVMware", "KVMKVMKVM\0\0\0",
+        "VBoxVBoxVBox", "XenVMMXenVMM", "prl hyperv  ",
+        "bhyve bhyve ", nullptr
+    };
+    for (int i = 0; vmVendors[i]; i++) {
+        if (memcmp(vendor, vmVendors[i], 12) == 0) return true;
+    }
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe = {}; pe.dwSize = sizeof(pe);
+        if (Process32First(snap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"vmtoolsd.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"vmwaretray.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"VBoxService.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"VBoxTray.exe") == 0 ||
+                    _wcsicmp(pe.szExeFile, L"qemu-ga.exe") == 0) {
+                    CloseHandle(snap);
+                    return true;
+                }
+            } while (Process32Next(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    return false;
+}
+
+// --- Saved license storage ---
+static std::string GetLicensePath()
+{
+    char appData[MAX_PATH];
+    GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
+    std::string dir = std::string(appData) + "\\Eclypse";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir + "\\license.dat";
+}
+
+static std::string LoadSavedKey()
+{
+    std::string path = GetLicensePath();
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+    char buf[256] = {};
+    DWORD read = 0;
+    ReadFile(hFile, buf, sizeof(buf) - 1, &read, nullptr);
+    CloseHandle(hFile);
+    return std::string(buf, read);
+}
+
+static void SaveKey(const char* key)
+{
+    std::string path = GetLicensePath();
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(hFile, key, (DWORD)strlen(key), &written, nullptr);
+    CloseHandle(hFile);
+}
+
+static void DeleteSavedKey()
+{
+    DeleteFileA(GetLicensePath().c_str());
+}
+
+// --- HTTPS POST via WinHTTP ---
+static std::string HttpPost(const std::string& postData)
+{
+    std::string result;
+    HINTERNET hSession = WinHttpOpen(L"Eclypse/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    if (!hSession) return "";
+
+    HINTERNET hConnect = WinHttpConnect(hSession,
+        L"keyauth.win", INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return ""; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/api/1.2/",
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return ""; }
+
+    const wchar_t* headers = L"Content-Type: application/x-www-form-urlencoded";
+    BOOL sent = WinHttpSendRequest(hRequest, headers, (DWORD)-1,
+        (LPVOID)postData.c_str(), (DWORD)postData.size(), (DWORD)postData.size(), 0);
+    if (sent) WinHttpReceiveResponse(hRequest, nullptr);
+
+    DWORD dwSize = 0;
+    do {
+        WinHttpQueryDataAvailable(hRequest, &dwSize);
+        if (dwSize > 0) {
+            std::string buf(dwSize, 0);
+            DWORD dwRead = 0;
+            WinHttpReadData(hRequest, &buf[0], dwSize, &dwRead);
+            buf.resize(dwRead);
+            result += buf;
+        }
+    } while (dwSize > 0);
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+
+// --- Minimal JSON field extractors ---
+static bool JsonBool(const std::string& json, const char* key)
+{
+    std::string k = std::string("\"") + key + "\":";
+    size_t p = json.find(k);
+    if (p == std::string::npos) return false;
+    return json.substr(p + k.size(), 4) == "true";
+}
+
+static std::string JsonStr(const std::string& json, const char* key)
+{
+    std::string k = std::string("\"") + key + "\":\"";
+    size_t p = json.find(k);
+    if (p == std::string::npos) return "";
+    p += k.size();
+    size_t e = json.find("\"", p);
+    return (e != std::string::npos) ? json.substr(p, e - p) : "";
+}
+
+static std::string JsonMessage(const std::string& json) { return JsonStr(json, "message"); }
+
+// --- KeyAuth API calls ---
+static std::string g_sessionId;
+static std::string g_expiryStr;
+static std::string g_timeLeftStr;
+
+static bool KeyAuthInit()
+{
+    std::string name = GetAppName();
+    std::string owner = GetOwnerId();
+    std::string post = "type=init&ver=1.0&name=" + name + "&ownerid=" + owner;
+    std::string resp = HttpPost(post);
+    if (resp.empty()) return false;
+    if (!JsonBool(resp, "success")) return false;
+    g_sessionId = JsonStr(resp, "sessionid");
+    return !g_sessionId.empty();
+}
+
+static std::string GetHWID()
+{
+    HW_PROFILE_INFOA hwInfo = {};
+    if (GetCurrentHwProfileA(&hwInfo)) {
+        return std::string(hwInfo.szHwProfileGuid);
+    }
+    return "unknown";
+}
+
+static void ParseExpiry(const std::string& resp)
+{
+    std::string expiry = JsonStr(resp, "expiry");
+    if (expiry.empty()) { g_expiryStr = "Unknown"; g_timeLeftStr = "Unknown"; return; }
+
+    time_t expiryTime = (time_t)_atoi64(expiry.c_str());
+    time_t now = time(nullptr);
+    long long diff = (long long)(expiryTime - now);
+
+    struct tm tmBuf = {};
+    localtime_s(&tmBuf, &expiryTime);
+    char dateBuf[64];
+    strftime(dateBuf, sizeof(dateBuf), "%b %d, %Y %H:%M", &tmBuf);
+    g_expiryStr = dateBuf;
+
+    if (diff <= 0) { g_timeLeftStr = "Expired"; return; }
+    long long days = diff / 86400;
+    long long hours = (diff % 86400) / 3600;
+    long long mins = (diff % 3600) / 60;
+    char buf[128];
+    if (days > 0)       sprintf_s(buf, "%lld day%s, %lld hour%s", days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s");
+    else if (hours > 0) sprintf_s(buf, "%lld hour%s, %lld min%s", hours, hours == 1 ? "" : "s", mins, mins == 1 ? "" : "s");
+    else                sprintf_s(buf, "%lld minute%s", mins, mins == 1 ? "" : "s");
+    g_timeLeftStr = buf;
+}
+
+static bool KeyAuthLicense(const char* key, std::string& outMsg)
+{
+    std::string hwid = GetHWID();
+    std::string name = GetAppName();
+    std::string owner = GetOwnerId();
+    std::string post = std::string("type=license&key=") + key
+        + "&hwid=" + hwid
+        + "&sessionid=" + g_sessionId
+        + "&name=" + name + "&ownerid=" + owner;
+    std::string resp = HttpPost(post);
+    if (resp.empty()) { outMsg = "Connection failed."; return false; }
+    outMsg = JsonMessage(resp);
+    bool ok = JsonBool(resp, "success");
+    if (ok) ParseExpiry(resp);
+    return ok;
+}
+
+// =====================================================
+// Login window (dark ECLYPSE theme)
+// =====================================================
+
+#define ID_KA_KEY_INPUT    2001
+#define ID_KA_BTN_LOGIN    2002
+#define ID_KA_STATUS       2003
+#define ID_KA_REMEMBER     2004
+
+static HWND g_hLoginWnd = nullptr;
+static HWND g_hKeyInput = nullptr;
+static HWND g_hBtnLogin = nullptr;
+static HWND g_hLoginStatus = nullptr;
+static HWND g_hRemember = nullptr;
+static bool g_btnLoginHover = false;
+static bool g_rememberChecked = false;
+static bool g_authenticated = false;
+
+static HBRUSH  g_loginBgBrush = nullptr;
+static HBRUSH  g_loginSurfBrush = nullptr;
+static HBRUSH  g_loginAccentBrush = nullptr;
+static HFONT   g_loginFont = nullptr;
+static HFONT   g_loginFontBold = nullptr;
+static HFONT   g_loginFontTitle = nullptr;
+
+static void DrawLoginButton(LPDRAWITEMSTRUCT dis, bool hover)
+{
+    HDC hdc = dis->hDC;
+    RECT rc = dis->rcItem;
+    COLORREF bg = hover ? Colors::AccentHover : Colors::Accent;
+    COLORREF border = hover ? Colors::AccentHover : Colors::AccentPress;
+
+    FillRect(hdc, &rc, g_loginBgBrush);
+    HBRUSH br = CreateSolidBrush(bg);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH oldBr = (HBRUSH)SelectObject(hdc, br);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(hdc, oldPen); SelectObject(hdc, oldBr);
+    DeleteObject(pen); DeleteObject(br);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(10, 10, 10));
+    SelectObject(hdc, g_loginFontBold);
+    wchar_t txt[64];
+    GetWindowTextW(dis->hwndItem, txt, 64);
+    DrawTextW(hdc, txt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+static LRESULT CALLBACK LoginWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        g_loginBgBrush = CreateSolidBrush(Colors::WindowBg);
+        g_loginSurfBrush = CreateSolidBrush(Colors::FrameBg);
+        g_loginAccentBrush = CreateSolidBrush(Colors::Accent);
+
+        g_loginFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        g_loginFontBold = CreateFontW(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Semibold");
+        g_loginFontTitle = CreateFontW(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        BOOL darkMode = TRUE;
+        DwmSetWindowAttribute(hWnd, 20, &darkMode, sizeof(darkMode));
+
+        HWND hLabel = CreateWindowW(L"STATIC", L"LICENSE KEY",
+            WS_CHILD | WS_VISIBLE, 30, 70, 200, 16, hWnd, nullptr, nullptr, nullptr);
+        SendMessageW(hLabel, WM_SETFONT, (WPARAM)g_loginFontBold, TRUE);
+
+        g_hKeyInput = CreateWindowExW(0, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            30, 92, 320, 36, hWnd, (HMENU)ID_KA_KEY_INPUT, nullptr, nullptr);
+        SendMessageW(g_hKeyInput, WM_SETFONT, (WPARAM)g_loginFont, TRUE);
+
+        g_hRemember = CreateWindowW(L"BUTTON", L"",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            30, 140, 200, 22, hWnd, (HMENU)ID_KA_REMEMBER, nullptr, nullptr);
+
+        std::string savedKey = LoadSavedKey();
+        if (!savedKey.empty()) {
+            SetWindowTextA(g_hKeyInput, savedKey.c_str());
+            g_rememberChecked = true;
+            InvalidateRect(g_hRemember, nullptr, TRUE);
+        }
+
+        g_hBtnLogin = CreateWindowW(L"BUTTON", L"Activate",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            30, 172, 320, 36, hWnd, (HMENU)ID_KA_BTN_LOGIN, nullptr, nullptr);
+
+        g_hLoginStatus = CreateWindowW(L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_CENTER, 30, 220, 320, 20,
+            hWnd, (HMENU)ID_KA_STATUS, nullptr, nullptr);
+        SendMessageW(g_hLoginStatus, WM_SETFONT, (WPARAM)g_loginFont, TRUE);
+
+        SetWindowTextW(g_hLoginStatus, L"Connecting...");
+        EnableWindow(g_hBtnLogin, FALSE);
+        PostMessageW(hWnd, WM_USER + 1, 0, 0);
+        return 0;
+    }
+
+    case WM_USER + 1: {
+        if (KeyAuthInit()) {
+            SetWindowTextW(g_hLoginStatus, L"Ready. Enter your license key.");
+            EnableWindow(g_hBtnLogin, TRUE);
+            SetFocus(g_hKeyInput);
+        } else {
+            SetWindowTextW(g_hLoginStatus, L"Failed to connect to auth server.");
+        }
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT rc; GetClientRect(hWnd, &rc);
+        FillRect(hdc, &rc, g_loginBgBrush);
+
+        RECT bar = { 0, 0, rc.right, 3 };
+        FillRect(hdc, &bar, g_loginAccentBrush);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SelectObject(hdc, g_loginFontTitle);
+        SetTextColor(hdc, Colors::Accent);
+        TextOutW(hdc, 30, 20, L"ECLYPSE", 7);
+
+        SelectObject(hdc, g_loginFont);
+        SetTextColor(hdc, Colors::TextDim);
+        TextOutW(hdc, 136, 32, L"Authentication", 14);
+
+        HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+        HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+        MoveToEx(hdc, 30, 58, nullptr);
+        LineTo(hdc, rc.right - 30, 58);
+        SelectObject(hdc, oldPen);
+        DeleteObject(sepPen);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND: return 1;
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcS = (HDC)wParam;
+        HWND hCtrl = (HWND)lParam;
+        SetBkMode(hdcS, TRANSPARENT);
+        if (hCtrl == g_hLoginStatus) {
+            wchar_t txt[256]; GetWindowTextW(g_hLoginStatus, txt, 256);
+            if (wcsstr(txt, L"Failed") || wcsstr(txt, L"Invalid") || wcsstr(txt, L"error"))
+                SetTextColor(hdcS, Colors::Danger);
+            else if (wcsstr(txt, L"Success") || wcsstr(txt, L"Ready"))
+                SetTextColor(hdcS, RGB(80, 200, 120));
+            else
+                SetTextColor(hdcS, Colors::TextDim);
+        } else {
+            SetTextColor(hdcS, Colors::TextDim);
+        }
+        SetBkColor(hdcS, Colors::WindowBg);
+        return (LRESULT)g_loginBgBrush;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdcE = (HDC)wParam;
+        SetTextColor(hdcE, Colors::Text);
+        SetBkColor(hdcE, Colors::FrameBg);
+        return (LRESULT)g_loginSurfBrush;
+    }
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
+        if (dis->CtlID == ID_KA_BTN_LOGIN) {
+            DrawLoginButton(dis, g_btnLoginHover);
+            return TRUE;
+        }
+        if (dis->CtlID == ID_KA_REMEMBER) {
+            HDC hdc = dis->hDC;
+            RECT rc = dis->rcItem;
+            FillRect(hdc, &rc, g_loginBgBrush);
+            RECT box = { rc.left, rc.top + 2, rc.left + 16, rc.top + 18 };
+            if (g_rememberChecked) {
+                HBRUSH fill = CreateSolidBrush(Colors::Accent);
+                FillRect(hdc, &box, fill);
+                DeleteObject(fill);
+                HPEN chkPen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                HPEN oldChkPen = (HPEN)SelectObject(hdc, chkPen);
+                MoveToEx(hdc, box.left + 3, box.top + 8, nullptr);
+                LineTo(hdc, box.left + 6, box.top + 12);
+                LineTo(hdc, box.left + 13, box.top + 4);
+                SelectObject(hdc, oldChkPen);
+                DeleteObject(chkPen);
+            } else {
+                HBRUSH fill = CreateSolidBrush(Colors::FrameBg);
+                FillRect(hdc, &box, fill);
+                DeleteObject(fill);
+                HPEN pen = CreatePen(PS_SOLID, 1, Colors::Border);
+                HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+                HBRUSH oldBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                Rectangle(hdc, box.left, box.top, box.right, box.bottom);
+                SelectObject(hdc, oldPen);
+                SelectObject(hdc, oldBr);
+                DeleteObject(pen);
+            }
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, Colors::TextDim);
+            SelectObject(hdc, g_loginFont);
+            RECT textRc = { box.right + 8, rc.top, rc.right, rc.bottom };
+            DrawTextW(hdc, L"Remember me", -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { LOWORD(lParam), HIWORD(lParam) };
+        RECT rcBtn;
+        GetWindowRect(g_hBtnLogin, &rcBtn);
+        MapWindowPoints(HWND_DESKTOP, hWnd, (POINT*)&rcBtn, 2);
+        bool newHover = PtInRect(&rcBtn, pt) != 0;
+        if (newHover != g_btnLoginHover) {
+            g_btnLoginHover = newHover;
+            InvalidateRect(g_hBtnLogin, nullptr, TRUE);
+        }
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_btnLoginHover) { g_btnLoginHover = false; InvalidateRect(g_hBtnLogin, nullptr, TRUE); }
+        return 0;
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_KA_REMEMBER) {
+            g_rememberChecked = !g_rememberChecked;
+            InvalidateRect(g_hRemember, nullptr, TRUE);
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_KA_BTN_LOGIN) {
+            char rawKey[256] = {};
+            GetWindowTextA(g_hKeyInput, rawKey, sizeof(rawKey));
+            if (strlen(rawKey) == 0) {
+                SetWindowTextW(g_hLoginStatus, L"Please enter a license key.");
+                InvalidateRect(g_hLoginStatus, nullptr, TRUE);
+                return 0;
+            }
+            SetWindowTextW(g_hLoginStatus, L"Validating...");
+            InvalidateRect(g_hLoginStatus, nullptr, TRUE);
+            UpdateWindow(g_hLoginStatus);
+            EnableWindow(g_hBtnLogin, FALSE);
+
+            if (DetectDebugger()) {
+                SetWindowTextW(g_hLoginStatus, L"Environment error.");
+                InvalidateRect(g_hLoginStatus, nullptr, TRUE);
+                EnableWindow(g_hBtnLogin, TRUE);
+                return 0;
+            }
+
+            std::string msg;
+            if (KeyAuthLicense(rawKey, msg)) {
+                if (g_rememberChecked) SaveKey(rawKey); else DeleteSavedKey();
+                g_authToken1 = AUTH_MAGIC1;
+                g_authToken2 = AUTH_MAGIC2;
+                SetWindowTextW(g_hLoginStatus, L"Success! Launching...");
+                InvalidateRect(g_hLoginStatus, nullptr, TRUE);
+                UpdateWindow(g_hLoginStatus);
+                g_authenticated = true;
+                Sleep(500);
+                DestroyWindow(hWnd);
+            } else {
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, nullptr, 0);
+                std::wstring wmsg(wlen > 0 ? wlen - 1 : 0, L'\0');
+                if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, &wmsg[0], wlen);
+                if (wmsg.empty()) wmsg = L"Invalid license key.";
+                SetWindowTextW(g_hLoginStatus, wmsg.c_str());
+                InvalidateRect(g_hLoginStatus, nullptr, TRUE);
+                EnableWindow(g_hBtnLogin, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_DESTROY:
+        DeleteObject(g_loginBgBrush);
+        DeleteObject(g_loginSurfBrush);
+        DeleteObject(g_loginAccentBrush);
+        DeleteObject(g_loginFont);
+        DeleteObject(g_loginFontBold);
+        DeleteObject(g_loginFontTitle);
+        if (!g_authenticated) PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static bool RunLoginGate(HINSTANCE hInstance)
+{
+    WNDCLASSEXW lcWc = {};
+    lcWc.cbSize = sizeof(lcWc);
+    lcWc.style = CS_HREDRAW | CS_VREDRAW;
+    lcWc.lpfnWndProc = LoginWndProc;
+    lcWc.hInstance = hInstance;
+    lcWc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    lcWc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    lcWc.hbrBackground = nullptr;
+    lcWc.lpszClassName = L"EclypseLogin";
+    RegisterClassExW(&lcWc);
+
+    g_hLoginWnd = CreateWindowExW(0, L"EclypseLogin", L"ECLYPSE - Login",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
+        nullptr, nullptr, hInstance, nullptr);
+
+    ShowWindow(g_hLoginWnd, SW_SHOWNORMAL);
+    UpdateWindow(g_hLoginWnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (g_authenticated && !IsWindow(g_hLoginWnd)) break;
+        if (!g_authenticated && !IsWindow(g_hLoginWnd)) break;
+    }
+    return g_authenticated && IsReallyAuthenticated() && !DetectDebugger();
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
@@ -5668,6 +6278,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                     if (result == IDYES)
                     {
+                        if (!IsReallyAuthenticated())
+                        {
+                            MessageBox(hwnd, L"Authentication required.", L"ECLYPSE", MB_OK | MB_ICONERROR);
+                            return 0;
+                        }
                         if (i == SPOOFER_BUTTON_1 || i == SPOOFER_BUTTON_3)
                         {
                             // Async load/restart with spinner + serial-change detection
@@ -6366,6 +6981,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
         RelaunchAsAdmin();
         return 0;
     }
+
+    if (DetectDebugger())
+    {
+        MessageBoxW(nullptr, L"This application cannot run in this environment.", L"ECLYPSE", MB_ICONERROR);
+        return 1;
+    }
+
+    if (DetectVM())
+    {
+        MessageBoxW(nullptr, L"Virtual machines are not supported.", L"ECLYPSE", MB_ICONERROR);
+        return 1;
+    }
+
+    if (!RunLoginGate(hInstance))
+        return 0;
 
     const wchar_t CLASS_NAME[] = L"EclypseWindow";
 
