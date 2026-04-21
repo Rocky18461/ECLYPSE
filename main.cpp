@@ -17,6 +17,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "rpcrt4.lib")
 
 // ECLYPSE color palette
 namespace Colors
@@ -3879,14 +3880,15 @@ std::wstring OptimGpuPriority()
 }
 
 // ============================================================
-// Spoofer driver (SpoofyDrivy.sys) — manual map via kdmapper
-// Driver bytes live in RCDATA resource and never touch disk.
+// Spoofer — user-mode HWID changes only.
+// Driver mapping was disabled (caused PAGE_FAULT_IN_NONPAGED_AREA
+// bugchecks inside the driver's SMBIOS walk). Fields needing kernel
+// access (SMBIOS UUID/serial, CPU ID, disk serial) are skipped here.
 // ============================================================
 
-#include "kdmapper.hpp"
-#include "intel_driver.hpp"
+#include <rpc.h>
 
-static bool g_driverMapped = false;
+static bool g_hwidSpoofed = false;
 
 std::wstring FormatWinError(DWORD err)
 {
@@ -3898,87 +3900,162 @@ std::wstring FormatWinError(DWORD err)
     return out;
 }
 
-// Load SpoofyDrivy.sys bytes from the embedded RCDATA resource.
-bool LoadDriverResource(std::vector<BYTE>& out)
+static std::wstring NewGuidString()
 {
-    HMODULE hMod = GetModuleHandle(nullptr);
-    HRSRC hRes = FindResource(hMod, MAKEINTRESOURCE(IDR_DRIVER_SYS), RT_RCDATA);
-    if (!hRes) return false;
-    DWORD size = SizeofResource(hMod, hRes);
-    HGLOBAL hGlobal = LoadResource(hMod, hRes);
-    if (!hGlobal || !size) return false;
-    const BYTE* data = (const BYTE*)LockResource(hGlobal);
-    if (!data) return false;
-    out.assign(data, data + size);
+    UUID u;
+    if (UuidCreate(&u) != RPC_S_OK) return L"";
+    RPC_WSTR s = nullptr;
+    if (UuidToStringW(&u, &s) != RPC_S_OK || !s) return L"";
+    std::wstring out = (wchar_t*)s;
+    RpcStringFreeW(&s);
+    return out;
+}
+
+static bool SpoofMachineGuid(std::wstring& oldVal, std::wstring& newVal, std::wstring& err)
+{
+    HKEY hKey;
+    LSTATUS r = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Cryptography", 0,
+        KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey);
+    if (r != ERROR_SUCCESS) { err = L"MachineGuid open: " + FormatWinError(r); return false; }
+
+    wchar_t cur[128] = {};
+    DWORD sz = sizeof(cur);
+    DWORD t = 0;
+    if (RegQueryValueExW(hKey, L"MachineGuid", nullptr, &t, (LPBYTE)cur, &sz) == ERROR_SUCCESS)
+        oldVal = cur;
+
+    std::wstring g = NewGuidString();
+    if (g.empty()) { RegCloseKey(hKey); err = L"UuidCreate failed"; return false; }
+
+    r = RegSetValueExW(hKey, L"MachineGuid", 0, REG_SZ,
+        (const BYTE*)g.c_str(), (DWORD)((g.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(hKey);
+    if (r != ERROR_SUCCESS) { err = L"MachineGuid write: " + FormatWinError(r); return false; }
+
+    newVal = g;
     return true;
+}
+
+static int SpoofAllAdapterMacs(std::wstring& summary)
+{
+    // Net adapter class key — every NIC has a NNNN subkey here whose
+    // NetworkAddress value overrides the hardware MAC on next restart.
+    HKEY hClass;
+    LSTATUS r = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}",
+        0, KEY_READ, &hClass);
+    if (r != ERROR_SUCCESS)
+    {
+        summary = L"MAC class key open: " + FormatWinError(r);
+        return 0;
+    }
+
+    int written = 0;
+    DWORD idx = 0;
+    wchar_t sub[64];
+    DWORD subLen;
+    for (;; idx++)
+    {
+        subLen = 64;
+        r = RegEnumKeyExW(hClass, idx, sub, &subLen, nullptr, nullptr, nullptr, nullptr);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r != ERROR_SUCCESS) break;
+        if (subLen != 4) continue;  // NNNN format only
+
+        HKEY hAdapter;
+        if (RegOpenKeyExW(hClass, sub, 0, KEY_READ | KEY_SET_VALUE, &hAdapter) != ERROR_SUCCESS)
+            continue;
+
+        // Skip pseudo-adapters — only ones with a Characteristics flag
+        // indicating physical NIC typically already have a DriverDesc.
+        wchar_t desc[128] = {};
+        DWORD descSz = sizeof(desc);
+        if (RegQueryValueExW(hAdapter, L"DriverDesc", nullptr, nullptr, (LPBYTE)desc, &descSz) != ERROR_SUCCESS)
+        {
+            RegCloseKey(hAdapter);
+            continue;
+        }
+
+        // Build a locally-administered, unicast MAC: first byte bit 1 set, bit 0 clear.
+        BYTE mac[6];
+        for (int i = 0; i < 6; i++) mac[i] = (BYTE)(GetTickCount() ^ (idx * 7 + i * 131));
+        // Re-seed with a bit more entropy
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        for (int i = 0; i < 6; i++) mac[i] ^= (BYTE)(qpc.QuadPart >> (i * 8));
+        mac[0] = (mac[0] & 0xFC) | 0x02;
+
+        wchar_t macStr[16];
+        swprintf_s(macStr, 16, L"%02X%02X%02X%02X%02X%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        LSTATUS w = RegSetValueExW(hAdapter, L"NetworkAddress", 0, REG_SZ,
+            (const BYTE*)macStr, (DWORD)((wcslen(macStr) + 1) * sizeof(wchar_t)));
+        RegCloseKey(hAdapter);
+        if (w != ERROR_SUCCESS) continue;
+
+        written++;
+    }
+    RegCloseKey(hClass);
+
+    wchar_t buf[128];
+    swprintf_s(buf, 128, L"MAC spoofed on %d adapter(s) (takes effect on adapter restart)", written);
+    summary = buf;
+    return written;
 }
 
 std::wstring SpooferLoad()
 {
-    if (g_driverMapped)
-        return L"Driver is already mapped in this session.\r\nManually-mapped drivers cannot be unloaded without a reboot.";
+    if (g_hwidSpoofed)
+        return L"HWID already spoofed this session. Reboot before spoofing again.";
 
-    std::vector<BYTE> driverBytes;
-    if (!LoadDriverResource(driverBytes))
-        return L"Failed to load embedded driver resource.";
+    std::wstring result;
+    result.reserve(512);
 
-    // Phase 1: exploit the vulnerable Intel driver to gain kernel r/w.
-    NTSTATUS st = intel_driver::Load();
-    if (!NT_SUCCESS(st))
+    std::wstring guidOld, guidNew, guidErr;
+    if (SpoofMachineGuid(guidOld, guidNew, guidErr))
     {
-        wchar_t msg[256];
-        swprintf_s(msg, 256,
-            L"Failed to load the vulnerable Intel driver (NTSTATUS 0x%08X).\r\n\r\n"
-            L"Likely causes:\r\n"
-            L"  - HVCI / Memory Integrity is enabled\r\n"
-            L"  - Vulnerable Driver Blocklist is enabled\r\n"
-            L"  - Secure Boot blocks the signed driver\r\n"
-            L"  - Test-signing mode is off and required", (unsigned)st);
-        return msg;
+        result += L"MachineGuid: ";
+        result += guidOld.empty() ? L"(unknown)" : guidOld;
+        result += L"\r\n         -> ";
+        result += guidNew;
+        result += L"\r\n\r\n";
+    }
+    else
+    {
+        result += L"MachineGuid FAILED: " + guidErr + L"\r\n\r\n";
     }
 
-    // Phase 2: manually map the embedded driver into kernel memory.
-    NTSTATUS exitCode = 0;
-    ULONG64 driverBase = kdmapper::MapDriver(
-        driverBytes.data(),
-        0, 0,
-        /*free=*/false,
-        /*destroyHeader=*/true,
-        kdmapper::AllocationMode::AllocatePool,
-        /*PassAllocationAddressAsFirstParam=*/false,
-        nullptr,
-        &exitCode);
+    std::wstring macSummary;
+    SpoofAllAdapterMacs(macSummary);
+    result += macSummary;
+    result += L"\r\n\r\n";
 
-    // Phase 3: remove the vulnerable driver regardless of outcome.
-    intel_driver::Unload();
+    result += L"Skipped (need kernel driver):\r\n";
+    result += L"  - SMBIOS UUID / System Serial\r\n";
+    result += L"  - Baseboard Serial\r\n";
+    result += L"  - CPU ID\r\n";
+    result += L"  - Disk Serial\r\n";
+    result += L"  - TPM / Monitor EDID\r\n";
 
-    if (!driverBase)
-    {
-        return L"Manual map failed. The exploit driver loaded but the mapping step did not complete. "
-               L"This can happen on very new Windows builds where the hardcoded offsets are stale.";
-    }
-
-    g_driverMapped = true;
-    wchar_t okMsg[160];
-    swprintf_s(okMsg, 160,
-        L"Driver mapped in kernel at 0x%llX.\r\nDriverEntry returned NTSTATUS 0x%08X.",
-        (unsigned long long)driverBase, (unsigned)exitCode);
-    return okMsg;
+    g_hwidSpoofed = true;
+    return result;
 }
 
 std::wstring SpooferUnload()
 {
-    if (!g_driverMapped)
-        return L"Driver is not currently mapped.";
-    return L"Manually-mapped drivers cannot be cleanly unloaded.\r\n\r\n"
-           L"The driver's code remains in kernel memory until reboot. "
-           L"Reboot the machine to remove it.";
+    if (!g_hwidSpoofed)
+        return L"Nothing to undo — HWID has not been spoofed this session.";
+    return L"User-mode spoof changes are persistent registry writes.\r\n"
+           L"Originals are not saved; a reboot restores nothing. "
+           L"Undo requires manually setting previous values if you saved them.";
 }
 
 std::wstring SpooferRestart()
 {
-    if (g_driverMapped)
-        return L"Driver is already mapped. A manually-mapped driver cannot be remapped without a reboot.";
+    if (g_hwidSpoofed)
+        return L"HWID already spoofed this session. Reboot before spoofing again.";
     return SpooferLoad();
 }
 
