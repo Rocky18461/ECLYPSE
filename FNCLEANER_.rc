@@ -1,0 +1,4 @@
+#include <windows.h>
+#include "resource.h"
+
+IDR_DRIVER_SYS RCDATA "SpoofyDrivy\\build\\Release\\SpoofyDrivy.sys"

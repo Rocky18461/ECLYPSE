@@ -2,17 +2,21 @@
 #include <dwmapi.h>
 #include <winioctl.h>
 #include <ShlObj.h>
+#include <iphlpapi.h>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <shlwapi.h>
+#include "resource.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 // ECLYPSE color palette
 namespace Colors
@@ -231,6 +235,27 @@ static RECT g_optimBtnRects[OPTIM_COUNT];
 // Experimental tab state
 static ButtonState g_expTabBtns[SPOOFER_COUNT];
 static RECT g_expTabBtnRects[SPOOFER_COUNT];
+
+// Spoofer HWID serials
+struct HwidSerials
+{
+    std::wstring systemUuid;
+    std::wstring systemSerial;
+    std::wstring baseboardSerial;
+    std::wstring diskSerial;
+    std::wstring macAddress;
+    std::wstring machineGuid;
+};
+static HwidSerials g_spoofSerials;
+static HwidSerials g_spoofSerialsBefore;
+static bool g_spoofSerialsLoaded = false;
+static bool g_spoofLoading = false;
+static int g_spoofSpinAngle = 0;
+static HANDLE g_spoofThread = nullptr;
+static std::wstring g_spoofLoadResult;
+static DWORD g_spoofLoadStartTime = 0;
+static bool g_spoofThreadDone = false;
+constexpr UINT_PTR TIMER_SPOOF_SPIN = 101;
 
 // Windows tab state
 static bool g_winDrivesLoaded = false;
@@ -1197,6 +1222,199 @@ void DrawDriveSelectPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+// ============================================================
+// HWID serial collection
+// ============================================================
+std::wstring TrimCopy(std::wstring s)
+{
+    size_t start = s.find_first_not_of(L" \t\r\n");
+    size_t end = s.find_last_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return L"";
+    return s.substr(start, end - start + 1);
+}
+
+std::wstring AnsiToWide(const char* s)
+{
+    if (!s || !*s) return L"";
+    int wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring out(wlen, 0);
+    MultiByteToWideChar(CP_ACP, 0, s, -1, &out[0], wlen);
+    while (!out.empty() && out.back() == 0) out.pop_back();
+    return out;
+}
+
+const char* SmbiosString(const BYTE* structStart, BYTE length, const BYTE* end, int index)
+{
+    if (index == 0) return "";
+    const char* p = (const char*)(structStart + length);
+    int cur = 1;
+    while (p < (const char*)end && *p)
+    {
+        if (cur == index) return p;
+        p += strlen(p) + 1;
+        cur++;
+    }
+    return "";
+}
+
+void ParseSmbios(HwidSerials& out)
+{
+    DWORD sz = GetSystemFirmwareTable('RSMB', 0, nullptr, 0);
+    if (!sz) return;
+    std::vector<BYTE> buf(sz);
+    DWORD got = GetSystemFirmwareTable('RSMB', 0, buf.data(), sz);
+    if (!got || got < 8) return;
+
+    const BYTE* data = buf.data() + 8;
+    const BYTE* end = buf.data() + got;
+
+    while (data + 4 <= end)
+    {
+        BYTE type = data[0];
+        BYTE length = data[1];
+        if (length < 4) break;
+        const BYTE* structStart = data;
+
+        // advance to end of strings (double null or end)
+        const BYTE* p = data + length;
+        while (p + 1 < end && !(p[0] == 0 && p[1] == 0)) p++;
+        const BYTE* structEnd = (p + 2 <= end) ? p + 2 : end;
+
+        if (type == 1 && length >= 0x19) // System Information
+        {
+            out.systemSerial = TrimCopy(AnsiToWide(SmbiosString(structStart, length, end, structStart[0x07])));
+            // UUID at offset 0x08..0x17
+            const BYTE* uuid = structStart + 0x08;
+            wchar_t uuidStr[64];
+            swprintf_s(uuidStr, 64,
+                L"%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                uuid[3], uuid[2], uuid[1], uuid[0],
+                uuid[5], uuid[4], uuid[7], uuid[6],
+                uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+            out.systemUuid = uuidStr;
+        }
+        else if (type == 2 && length >= 0x08) // Baseboard
+        {
+            out.baseboardSerial = TrimCopy(AnsiToWide(SmbiosString(structStart, length, end, structStart[0x07])));
+        }
+
+        if (type == 127) break; // End of table
+        data = structEnd;
+    }
+}
+
+std::wstring GetDiskSerialStr()
+{
+    HANDLE h = CreateFile(L"\\\\.\\PhysicalDrive0", 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+
+    STORAGE_PROPERTY_QUERY q = {};
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType = PropertyStandardQuery;
+
+    BYTE buf[1024] = {};
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY,
+        &q, sizeof(q), buf, sizeof(buf), &bytesReturned, nullptr);
+    CloseHandle(h);
+    if (!ok) return L"";
+
+    auto* desc = (STORAGE_DEVICE_DESCRIPTOR*)buf;
+    if (!desc->SerialNumberOffset || desc->SerialNumberOffset >= bytesReturned) return L"";
+    return TrimCopy(AnsiToWide((const char*)(buf + desc->SerialNumberOffset)));
+}
+
+std::wstring GetPrimaryMacStr()
+{
+    ULONG size = 0;
+    GetAdaptersInfo(nullptr, &size);
+    if (!size) return L"";
+    std::vector<BYTE> buf(size);
+    PIP_ADAPTER_INFO info = (PIP_ADAPTER_INFO)buf.data();
+    if (GetAdaptersInfo(info, &size) != ERROR_SUCCESS) return L"";
+
+    for (PIP_ADAPTER_INFO a = info; a; a = a->Next)
+    {
+        if (a->Type == MIB_IF_TYPE_LOOPBACK) continue;
+        if (a->AddressLength != 6) continue;
+        bool allZero = true;
+        for (int i = 0; i < 6; i++) if (a->Address[i]) { allZero = false; break; }
+        if (allZero) continue;
+        wchar_t mac[32];
+        swprintf_s(mac, 32, L"%02X-%02X-%02X-%02X-%02X-%02X",
+            a->Address[0], a->Address[1], a->Address[2],
+            a->Address[3], a->Address[4], a->Address[5]);
+        return mac;
+    }
+    return L"";
+}
+
+std::wstring GetMachineGuidStr()
+{
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography",
+        0, KEY_READ | KEY_WOW64_64KEY, &hKey) != ERROR_SUCCESS)
+        return L"";
+    wchar_t val[128] = {};
+    DWORD size = sizeof(val);
+    DWORD type = 0;
+    LSTATUS r = RegQueryValueEx(hKey, L"MachineGuid", nullptr, &type, (LPBYTE)val, &size);
+    RegCloseKey(hKey);
+    if (r != ERROR_SUCCESS) return L"";
+    return val;
+}
+
+HwidSerials CollectHwidSerials()
+{
+    HwidSerials s;
+    ParseSmbios(s);
+    s.diskSerial = GetDiskSerialStr();
+    s.macAddress = GetPrimaryMacStr();
+    s.machineGuid = GetMachineGuidStr();
+    return s;
+}
+
+bool HwidSerialsDiffer(const HwidSerials& a, const HwidSerials& b)
+{
+    return a.systemUuid != b.systemUuid
+        || a.systemSerial != b.systemSerial
+        || a.baseboardSerial != b.baseboardSerial
+        || a.diskSerial != b.diskSerial
+        || a.macAddress != b.macAddress
+        || a.machineGuid != b.machineGuid;
+}
+
+void DrawSpoofSpinner(HDC hdc, int cx, int cy, int radius)
+{
+    constexpr int DOTS = 10;
+    for (int i = 0; i < DOTS; i++)
+    {
+        double angle = ((double)g_spoofSpinAngle - i * (360.0 / DOTS)) * 3.14159265358979 / 180.0;
+        int dx = cx + (int)(cos(angle) * radius);
+        int dy = cy + (int)(sin(angle) * radius);
+
+        int fade = 255 - i * (220 / DOTS);
+        if (fade < 60) fade = 60;
+        COLORREF col = RGB(
+            (140 * fade) / 255 + (20 * (255 - fade)) / 255,
+            (102 * fade) / 255 + (20 * (255 - fade)) / 255,
+            (230 * fade) / 255 + (32 * (255 - fade)) / 255);
+
+        HBRUSH br = CreateSolidBrush(col);
+        HPEN pen = CreatePen(PS_SOLID, 1, col);
+        HBRUSH oldBr = (HBRUSH)SelectObject(hdc, br);
+        HPEN oldPn = (HPEN)SelectObject(hdc, pen);
+        int r = 5;
+        Ellipse(hdc, dx - r, dy - r, dx + r, dy + r);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPn);
+        DeleteObject(br);
+        DeleteObject(pen);
+    }
+}
+
 void DrawExperimentalPanel(HDC hdc, RECT clientRect)
 {
     int contentLeft = SIDEBAR_WIDTH + 30;
@@ -1220,28 +1438,82 @@ void DrawExperimentalPanel(HDC hdc, RECT clientRect)
     SetTextColor(hdc, Colors::TextDim);
     SelectObject(hdc, g_descFont);
     RECT descRect = { contentLeft, 75, contentRight, 100 };
-    DrawText(hdc, L"Load the driver to spoof, may take a while.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+    DrawText(hdc, L"Load the driver to spoof. This may take a moment.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
 
-    int btnWidth = 260;
-    int btnHeight = 44;
-    int spacing = 12;
-    int startY = 120;
+    // Horizontal row of 3 buttons
+    int btnWidth = 130;
+    int btnHeight = 40;
+    int btnGap = 12;
+    int totalBtnWidth = btnWidth * SPOOFER_COUNT + btnGap * (SPOOFER_COUNT - 1);
+    int btnRowLeft = contentCenterX - totalBtnWidth / 2;
+    int btnTop = 110;
 
     for (int i = 0; i < SPOOFER_COUNT; i++)
     {
         RECT btnRect;
-        btnRect.left = contentCenterX - btnWidth / 2;
+        btnRect.left = btnRowLeft + i * (btnWidth + btnGap);
         btnRect.right = btnRect.left + btnWidth;
-        btnRect.top = startY + i * (btnHeight + spacing + 20);
-        btnRect.bottom = btnRect.top + btnHeight;
+        btnRect.top = btnTop;
+        btnRect.bottom = btnTop + btnHeight;
         g_expTabBtnRects[i] = btnRect;
-
         DrawRoundedButton(hdc, btnRect, g_spooferNames[i], g_expTabBtns[i]);
+    }
+
+    // Separator under buttons
+    HPEN sep2 = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen2 = (HPEN)SelectObject(hdc, sep2);
+    MoveToEx(hdc, contentLeft, btnTop + btnHeight + 18, nullptr);
+    LineTo(hdc, contentRight, btnTop + btnHeight + 18);
+    SelectObject(hdc, oldPen2);
+    DeleteObject(sep2);
+
+    // Serials header
+    SetTextColor(hdc, Colors::Text);
+    SelectObject(hdc, g_buttonFont);
+    RECT sHeader = { contentLeft, btnTop + btnHeight + 24, contentRight, btnTop + btnHeight + 46 };
+    DrawText(hdc, L"HWID Serials", -1, &sHeader, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // Serial rows
+    struct Row { const wchar_t* label; const std::wstring* value; };
+    Row rows[] = {
+        { L"System UUID",      &g_spoofSerials.systemUuid },
+        { L"System Serial",    &g_spoofSerials.systemSerial },
+        { L"Baseboard Serial", &g_spoofSerials.baseboardSerial },
+        { L"Disk Serial",      &g_spoofSerials.diskSerial },
+        { L"MAC Address",      &g_spoofSerials.macAddress },
+        { L"Machine GUID",     &g_spoofSerials.machineGuid },
+    };
+
+    int rowY = btnTop + btnHeight + 56;
+    int rowHeight = 26;
+    int labelW = 150;
+
+    for (const auto& r : rows)
+    {
+        RECT labelRect = { contentLeft + 8, rowY, contentLeft + 8 + labelW, rowY + rowHeight };
+        SetTextColor(hdc, Colors::TextDim);
+        SelectObject(hdc, g_smallFont);
+        DrawText(hdc, r.label, -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        RECT valRect = { contentLeft + 8 + labelW, rowY, contentRight - 8, rowY + rowHeight };
+        SetTextColor(hdc, Colors::Text);
+        SelectObject(hdc, g_smallFont);
+        std::wstring display = r.value->empty() ? std::wstring(L"(unavailable)") : *r.value;
+        DrawText(hdc, display.c_str(), -1, &valRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        rowY += rowHeight;
+    }
+
+    // Spinner overlay while loading
+    if (g_spoofLoading)
+    {
+        int spinCenterY = clientRect.bottom - 70;
+        DrawSpoofSpinner(hdc, contentCenterX, spinCenterY, 18);
 
         SetTextColor(hdc, Colors::TextDim);
         SelectObject(hdc, g_smallFont);
-        RECT optDesc = { contentLeft, btnRect.bottom + 4, contentRight, btnRect.bottom + 22 };
-        DrawText(hdc, g_spooferDesc[i], -1, &optDesc, DT_CENTER | DT_SINGLELINE);
+        RECT loadRect = { contentLeft, spinCenterY + 22, contentRight, spinCenterY + 42 };
+        DrawText(hdc, L"Loading driver and waiting for HWID change...", -1, &loadRect, DT_CENTER | DT_SINGLELINE);
     }
 
     SelectObject(hdc, oldFont);
@@ -2503,6 +2775,11 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
     }
     else if (g_activeTab == TAB_SPOOFER)
     {
+        if (!g_spoofSerialsLoaded)
+        {
+            g_spoofSerials = CollectHwidSerials();
+            g_spoofSerialsLoaded = true;
+        }
         DrawExperimentalPanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_PARTITIONS)
@@ -3602,42 +3879,14 @@ std::wstring OptimGpuPriority()
 }
 
 // ============================================================
-// Spoofer driver (SpoofyDrivy.sys) — load/unload/restart
+// Spoofer driver (SpoofyDrivy.sys) — manual map via kdmapper
+// Driver bytes live in RCDATA resource and never touch disk.
 // ============================================================
 
-constexpr const wchar_t* SPOOFER_SERVICE_NAME = L"SpoofyDrivy";
-constexpr const wchar_t* SPOOFER_DISPLAY_NAME = L"SpoofyDrivy Spoofer";
+#include "kdmapper.hpp"
+#include "intel_driver.hpp"
 
-// Locate SpoofyDrivy.sys — try a few candidate paths relative to the exe,
-// then fall back to the original source location.
-std::wstring FindSpooferSysPath()
-{
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileName(nullptr, exePath, MAX_PATH);
-    std::wstring exeDir = exePath;
-    size_t lastSlash = exeDir.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos) exeDir.resize(lastSlash);
-
-    std::wstring candidates[] = {
-        exeDir + L"\\SpoofyDrivy.sys",
-        exeDir + L"\\..\\..\\SpoofyDrivy\\build\\Debug\\SpoofyDrivy.sys",
-        exeDir + L"\\..\\..\\SpoofyDrivy\\build\\Release\\SpoofyDrivy.sys",
-        L"C:\\Projects\\driver\\build\\Debug\\SpoofyDrivy.sys",
-        L"C:\\Projects\\driver\\build\\Release\\SpoofyDrivy.sys",
-    };
-
-    for (const auto& c : candidates)
-    {
-        if (GetFileAttributes(c.c_str()) != INVALID_FILE_ATTRIBUTES)
-        {
-            wchar_t full[MAX_PATH];
-            if (GetFullPathName(c.c_str(), MAX_PATH, full, nullptr))
-                return full;
-            return c;
-        }
-    }
-    return L"";
-}
+static bool g_driverMapped = false;
 
 std::wstring FormatWinError(DWORD err)
 {
@@ -3649,108 +3898,107 @@ std::wstring FormatWinError(DWORD err)
     return out;
 }
 
-// Register the service if missing. Returns service handle (caller closes), or nullptr with errOut set.
-SC_HANDLE OpenOrCreateSpooferService(SC_HANDLE scm, const std::wstring& sysPath, DWORD& errOut)
+// Load SpoofyDrivy.sys bytes from the embedded RCDATA resource.
+bool LoadDriverResource(std::vector<BYTE>& out)
 {
-    SC_HANDLE svc = OpenService(scm, SPOOFER_SERVICE_NAME, SERVICE_ALL_ACCESS);
-    if (svc) { errOut = 0; return svc; }
-    DWORD openErr = GetLastError();
-    if (openErr != ERROR_SERVICE_DOES_NOT_EXIST) { errOut = openErr; return nullptr; }
-
-    if (sysPath.empty()) { errOut = ERROR_FILE_NOT_FOUND; return nullptr; }
-
-    svc = CreateService(scm, SPOOFER_SERVICE_NAME, SPOOFER_DISPLAY_NAME,
-        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-        sysPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
-    if (!svc) { errOut = GetLastError(); return nullptr; }
-    errOut = 0;
-    return svc;
+    HMODULE hMod = GetModuleHandle(nullptr);
+    HRSRC hRes = FindResource(hMod, MAKEINTRESOURCE(IDR_DRIVER_SYS), RT_RCDATA);
+    if (!hRes) return false;
+    DWORD size = SizeofResource(hMod, hRes);
+    HGLOBAL hGlobal = LoadResource(hMod, hRes);
+    if (!hGlobal || !size) return false;
+    const BYTE* data = (const BYTE*)LockResource(hGlobal);
+    if (!data) return false;
+    out.assign(data, data + size);
+    return true;
 }
 
 std::wstring SpooferLoad()
 {
-    std::wstring sysPath = FindSpooferSysPath();
-    if (sysPath.empty())
-        return L"Could not locate SpoofyDrivy.sys.\r\n\r\nExpected near the exe, in SpoofyDrivy\\build\\Debug\\, or in C:\\Projects\\driver\\build\\Debug\\.";
+    if (g_driverMapped)
+        return L"Driver is already mapped in this session.\r\nManually-mapped drivers cannot be unloaded without a reboot.";
 
-    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-    if (!scm) return L"OpenSCManager failed: " + FormatWinError(GetLastError());
+    std::vector<BYTE> driverBytes;
+    if (!LoadDriverResource(driverBytes))
+        return L"Failed to load embedded driver resource.";
 
-    DWORD err = 0;
-    SC_HANDLE svc = OpenOrCreateSpooferService(scm, sysPath, err);
-    if (!svc) { CloseServiceHandle(scm); return L"Service registration failed: " + FormatWinError(err); }
-
-    std::wstring result;
-    if (StartService(svc, 0, nullptr))
+    // Phase 1: exploit the vulnerable Intel driver to gain kernel r/w.
+    NTSTATUS st = intel_driver::Load();
+    if (!NT_SUCCESS(st))
     {
-        result = L"Driver loaded successfully.\r\n\r\nPath: " + sysPath;
-    }
-    else
-    {
-        DWORD startErr = GetLastError();
-        if (startErr == ERROR_SERVICE_ALREADY_RUNNING)
-            result = L"Driver is already running.\r\n\r\nPath: " + sysPath;
-        else
-            result = L"StartService failed: " + FormatWinError(startErr) +
-                     L"\r\n\r\nIf this is an unsigned driver, Windows must be in test-signing mode (bcdedit /set testsigning on, then reboot).";
+        wchar_t msg[256];
+        swprintf_s(msg, 256,
+            L"Failed to load the vulnerable Intel driver (NTSTATUS 0x%08X).\r\n\r\n"
+            L"Likely causes:\r\n"
+            L"  - HVCI / Memory Integrity is enabled\r\n"
+            L"  - Vulnerable Driver Blocklist is enabled\r\n"
+            L"  - Secure Boot blocks the signed driver\r\n"
+            L"  - Test-signing mode is off and required", (unsigned)st);
+        return msg;
     }
 
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-    return result;
+    // Phase 2: manually map the embedded driver into kernel memory.
+    NTSTATUS exitCode = 0;
+    ULONG64 driverBase = kdmapper::MapDriver(
+        driverBytes.data(),
+        0, 0,
+        /*free=*/false,
+        /*destroyHeader=*/true,
+        kdmapper::AllocationMode::AllocatePool,
+        /*PassAllocationAddressAsFirstParam=*/false,
+        nullptr,
+        &exitCode);
+
+    // Phase 3: remove the vulnerable driver regardless of outcome.
+    intel_driver::Unload();
+
+    if (!driverBase)
+    {
+        return L"Manual map failed. The exploit driver loaded but the mapping step did not complete. "
+               L"This can happen on very new Windows builds where the hardcoded offsets are stale.";
+    }
+
+    g_driverMapped = true;
+    wchar_t okMsg[160];
+    swprintf_s(okMsg, 160,
+        L"Driver mapped in kernel at 0x%llX.\r\nDriverEntry returned NTSTATUS 0x%08X.",
+        (unsigned long long)driverBase, (unsigned)exitCode);
+    return okMsg;
 }
 
 std::wstring SpooferUnload()
 {
-    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-    if (!scm) return L"OpenSCManager failed: " + FormatWinError(GetLastError());
-
-    SC_HANDLE svc = OpenService(scm, SPOOFER_SERVICE_NAME, SERVICE_ALL_ACCESS);
-    if (!svc)
-    {
-        DWORD err = GetLastError();
-        CloseServiceHandle(scm);
-        if (err == ERROR_SERVICE_DOES_NOT_EXIST)
-            return L"Driver is not registered (nothing to unload).";
-        return L"OpenService failed: " + FormatWinError(err);
-    }
-
-    std::wstring result;
-    SERVICE_STATUS status = {};
-    if (ControlService(svc, SERVICE_CONTROL_STOP, &status))
-    {
-        result = L"Driver stopped. ";
-    }
-    else
-    {
-        DWORD err = GetLastError();
-        if (err == ERROR_SERVICE_NOT_ACTIVE)
-            result = L"Driver was not running. ";
-        else
-            result = L"ControlService(STOP) failed: " + FormatWinError(err) +
-                     L"\r\n(SpoofyDrivy has no DriverUnload routine — delete the service instead.)\r\n";
-    }
-
-    if (DeleteService(svc))
-        result += L"Service deleted.";
-    else
-        result += L"DeleteService failed: " + FormatWinError(GetLastError());
-
-    CloseServiceHandle(svc);
-    CloseServiceHandle(scm);
-    return result;
+    if (!g_driverMapped)
+        return L"Driver is not currently mapped.";
+    return L"Manually-mapped drivers cannot be cleanly unloaded.\r\n\r\n"
+           L"The driver's code remains in kernel memory until reboot. "
+           L"Reboot the machine to remove it.";
 }
 
 std::wstring SpooferRestart()
 {
-    std::wstring stopResult = SpooferUnload();
-    std::wstring startResult = SpooferLoad();
-    return L"Unload step:\r\n" + stopResult + L"\r\n\r\nLoad step:\r\n" + startResult;
+    if (g_driverMapped)
+        return L"Driver is already mapped. A manually-mapped driver cannot be remapped without a reboot.";
+    return SpooferLoad();
 }
 
 std::wstring ExpButton1() { return SpooferLoad(); }
 std::wstring ExpButton2() { return SpooferUnload(); }
 std::wstring ExpButton3() { return SpooferRestart(); }
+
+DWORD WINAPI SpooferLoadThreadProc(LPVOID)
+{
+    g_spoofLoadResult = SpooferLoad();
+    g_spoofThreadDone = true;
+    return 0;
+}
+
+DWORD WINAPI SpooferRestartThreadProc(LPVOID)
+{
+    g_spoofLoadResult = SpooferRestart();
+    g_spoofThreadDone = true;
+    return 0;
+}
 
 // ============================================================
 // Disk functions
@@ -5408,20 +5656,40 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
                 if (wasPressed && PtInRect(&g_expTabBtnRects[i], pt))
                 {
+                    if (g_spoofLoading)
+                    {
+                        InvalidateRect(hwnd, &g_expTabBtnRects[i], FALSE);
+                        return 0;
+                    }
+
                     wchar_t confirmMsg[256];
                     wsprintfW(confirmMsg, L"Run experimental action: %s?\n\n%s", g_spooferNames[i], g_spooferDesc[i]);
                     int result = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Experimental", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
 
                     if (result == IDYES)
                     {
-                        std::wstring resultStr;
-                        switch (i)
+                        if (i == SPOOFER_BUTTON_1 || i == SPOOFER_BUTTON_3)
                         {
-                        case SPOOFER_BUTTON_1: resultStr = ExpButton1(); break;
-                        case SPOOFER_BUTTON_2: resultStr = ExpButton2(); break;
-                        case SPOOFER_BUTTON_3: resultStr = ExpButton3(); break;
+                            // Async load/restart with spinner + serial-change detection
+                            g_spoofSerialsBefore = CollectHwidSerials();
+                            g_spoofLoadStartTime = GetTickCount();
+                            g_spoofLoading = true;
+                            g_spoofThreadDone = false;
+                            g_spoofSpinAngle = 0;
+                            g_spoofLoadResult.clear();
+                            LPTHREAD_START_ROUTINE proc = (i == SPOOFER_BUTTON_1)
+                                ? SpooferLoadThreadProc : SpooferRestartThreadProc;
+                            g_spoofThread = CreateThread(nullptr, 0, proc, nullptr, 0, nullptr);
+                            SetTimer(hwnd, TIMER_SPOOF_SPIN, 60, nullptr);
+                            InvalidateRect(hwnd, nullptr, FALSE);
                         }
-                        MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Experimental", MB_OK | MB_ICONINFORMATION);
+                        else
+                        {
+                            std::wstring resultStr = ExpButton2();
+                            MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Experimental", MB_OK | MB_ICONINFORMATION);
+                            g_spoofSerials = CollectHwidSerials();
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
                     }
 
                     InvalidateRect(hwnd, &g_expTabBtnRects[i], FALSE);
@@ -5904,6 +6172,71 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             }
 
             InvalidateRect(hwnd, &g_actionBtnRect, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
+    {
+        if (wParam == TIMER_SPOOF_SPIN && g_spoofLoading)
+        {
+            g_spoofSpinAngle = (g_spoofSpinAngle + 30) % 360;
+
+            bool threadDone = g_spoofThreadDone;
+            bool finish = false;
+            bool detectedChange = false;
+            DWORD elapsed = GetTickCount() - g_spoofLoadStartTime;
+
+            if (threadDone)
+            {
+                HwidSerials now = CollectHwidSerials();
+                detectedChange = HwidSerialsDiffer(g_spoofSerialsBefore, now);
+                if (detectedChange)
+                {
+                    g_spoofSerials = now;
+                    finish = true;
+                }
+                else if (elapsed > 10000)
+                {
+                    g_spoofSerials = now;
+                    finish = true;
+                }
+            }
+            else if (elapsed > 30000)
+            {
+                // hard timeout even if thread is stuck
+                finish = true;
+            }
+
+            if (finish)
+            {
+                KillTimer(hwnd, TIMER_SPOOF_SPIN);
+                g_spoofLoading = false;
+                if (g_spoofThread)
+                {
+                    WaitForSingleObject(g_spoofThread, 500);
+                    CloseHandle(g_spoofThread);
+                    g_spoofThread = nullptr;
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+
+                if (detectedChange)
+                {
+                    MessageBox(hwnd, L"Done. HWID serials have been changed.",
+                        L"ECLYPSE - Spoofer", MB_OK | MB_ICONINFORMATION);
+                }
+                else
+                {
+                    std::wstring msg = L"Driver action finished, but no HWID change was detected within 10 seconds.\r\n\r\n";
+                    msg += g_spoofLoadResult;
+                    MessageBox(hwnd, msg.c_str(),
+                        L"ECLYPSE - Spoofer", MB_OK | MB_ICONWARNING);
+                }
+            }
+            else
+            {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         return 0;
     }
