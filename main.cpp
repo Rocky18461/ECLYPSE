@@ -4857,6 +4857,40 @@ static bool IsReallyAuthenticated()
     return (g_authToken1 == AUTH_MAGIC1) && (g_authToken2 == AUTH_MAGIC2);
 }
 
+static bool DetectDebugger();
+
+// Hard exit — don't give crackers a clean exit point
+static void AntiCrackExit()
+{
+    *(volatile int*)nullptr = 0;
+}
+
+// Anti-tamper: FNV-1a hash of a byte range (for code-integrity checks)
+static DWORD HashBytes(const void* ptr, size_t len)
+{
+    DWORD hash = 0x811C9DC5;
+    const BYTE* data = (const BYTE*)ptr;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 0x01000193;
+    }
+    return hash;
+}
+
+// Background watchdog: re-verifies auth tokens + debugger status continuously.
+// If either check fails after login, crash immediately.
+static DWORD WINAPI AntiCrackWatchdog(LPVOID)
+{
+    DWORD baseHash = HashBytes((void*)&IsReallyAuthenticated, 64);
+    while (true) {
+        Sleep(2500);
+        if (!IsReallyAuthenticated()) AntiCrackExit();
+        if (DetectDebugger()) AntiCrackExit();
+        if (HashBytes((void*)&IsReallyAuthenticated, 64) != baseHash) AntiCrackExit();
+    }
+    return 0;
+}
+
 // --- Anti-debug: multiple layered checks ---
 static bool DetectDebugger()
 {
@@ -6283,6 +6317,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                             MessageBox(hwnd, L"Authentication required.", L"ECLYPSE", MB_OK | MB_ICONERROR);
                             return 0;
                         }
+                        if (DetectDebugger()) AntiCrackExit();
                         if (i == SPOOFER_BUTTON_1 || i == SPOOFER_BUTTON_3)
                         {
                             // Async load/restart with spinner + serial-change detection
@@ -6996,6 +7031,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow)
 
     if (!RunLoginGate(hInstance))
         return 0;
+
+    CreateThread(nullptr, 0, AntiCrackWatchdog, nullptr, 0, nullptr);
 
     const wchar_t CLASS_NAME[] = L"EclypseWindow";
 
