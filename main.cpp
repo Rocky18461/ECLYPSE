@@ -11,6 +11,8 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 // ECLYPSE color palette
 namespace Colors
@@ -43,6 +45,7 @@ enum Tab
     TAB_CLEANER,
     TAB_SPOOFER,
     TAB_PARTITIONS,
+    TAB_WINDOWS,
     TAB_OPTIMIZATION,
     TAB_RESTORE,
     TAB_STARTUP,
@@ -57,6 +60,7 @@ static const wchar_t* g_tabNames[TAB_COUNT] = {
     L"Cleaner",
 	L"Spoofer",
     L"Partitions",
+    L"Windows",
     L"Optimization",
     L"Restore",
     L"Startup",
@@ -68,7 +72,9 @@ static const wchar_t* g_tabNames[TAB_COUNT] = {
 
 static const wchar_t* g_tabDescriptions[TAB_COUNT] = {
     L"Wipe an entire drive. All data will be permanently deleted.",
+    L"Spoof hardware identifiers via driver.",
     L"Manage disk partitions and Windows installation guide.",
+    L"Install Windows to a partition and replicate it across the others.",
     L"Optimize Windows settings for maximum gaming performance.",
     L"Create a Windows system restore point.",
     L"Manage programs that run at Windows startup.",
@@ -226,6 +232,18 @@ static RECT g_optimBtnRects[OPTIM_COUNT];
 static ButtonState g_expTabBtns[SPOOFER_COUNT];
 static RECT g_expTabBtnRects[SPOOFER_COUNT];
 
+// Windows tab state
+static bool g_winDrivesLoaded = false;
+static std::vector<DriveInfo> g_winDrives;
+static std::vector<RECT> g_winDriveBtnRects;
+static std::vector<ButtonState> g_winDriveBtnStates;
+static int g_winSelectedDrive = -1;
+static int g_winScrollY = 0;
+static ButtonState g_winInstallBtn;
+static ButtonState g_winCopyAllBtn;
+static RECT g_winInstallBtnRect = {};
+static RECT g_winCopyAllBtnRect = {};
+
 // Restore tab state
 static ButtonState g_restoreCreateBtn;
 static ButtonState g_restoreLoadBtn;
@@ -347,6 +365,8 @@ static RECT g_uninstallRefreshBtnRect = {};
 
 // Forward declarations
 bool RunHiddenCommand(const wchar_t* cmd, DWORD timeoutMs = 30000);
+void EnumerateWindowsDrives();
+std::wstring FormatBytes(ULONGLONG bytes);
 
 constexpr int SIDEBAR_WIDTH = 150;
 constexpr int TAB_HEIGHT = 38;
@@ -2165,6 +2185,311 @@ void DrawUninstallerPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+// ============================================================
+// Windows tab
+// ============================================================
+void EnumerateWindowsDrives()
+{
+    g_winDrives.clear();
+    DWORD driveMask = GetLogicalDrives();
+    for (int i = 0; i < 26; i++)
+    {
+        if (!(driveMask & (1 << i))) continue;
+        wchar_t root[] = { (wchar_t)(L'A' + i), L':', L'\\', 0 };
+        UINT driveType = GetDriveType(root);
+        if (driveType != DRIVE_FIXED && driveType != DRIVE_REMOVABLE) continue;
+
+        DriveInfo info = {};
+        info.letter = L'A' + i;
+        info.typeStr = (driveType == DRIVE_REMOVABLE) ? L"Removable" : L"Local Disk";
+
+        wchar_t volumeName[MAX_PATH] = {};
+        GetVolumeInformation(root, volumeName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
+        info.label = volumeName[0] ? volumeName : info.typeStr;
+
+        GetDiskFreeSpaceEx(root, nullptr, &info.totalBytes, &info.freeBytes);
+        g_winDrives.push_back(info);
+    }
+
+    g_winDriveBtnRects.resize(g_winDrives.size());
+    g_winDriveBtnStates.resize(g_winDrives.size());
+    for (auto& s : g_winDriveBtnStates) s = {};
+}
+
+void DrawWindowsPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    // Header
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Windows", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // Separator
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    // Description
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Install Windows from an ISO to a partition, then replicate it to every other partition.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    // Warning
+    SetTextColor(hdc, Colors::Warning);
+    SelectObject(hdc, g_descFont);
+    RECT warnRect = { contentLeft, 100, contentRight, 160 };
+    DrawText(hdc, L"Warning: this may take a long time. On mid to low-end systems the computer will slow down noticeably while the copy is running.", -1, &warnRect, DT_LEFT | DT_WORDBREAK);
+
+    SelectObject(hdc, oldFont);
+
+    // Drive list
+    int btnWidth = 380;
+    int btnHeight = 42;
+    int spacing = 8;
+    int startY = 165 - g_winScrollY;
+
+    HRGN clipRgn = CreateRectRgn(contentLeft, 160, contentRight, clientRect.bottom - 110);
+    SelectClipRgn(hdc, clipRgn);
+
+    for (size_t i = 0; i < g_winDrives.size(); i++)
+    {
+        RECT btnRect;
+        btnRect.left = contentCenterX - btnWidth / 2;
+        btnRect.right = btnRect.left + btnWidth;
+        btnRect.top = startY + (int)i * (btnHeight + spacing);
+        btnRect.bottom = btnRect.top + btnHeight;
+        g_winDriveBtnRects[i] = btnRect;
+
+        bool isSelected = (g_winSelectedDrive == (int)i);
+        COLORREF bgColor = isSelected ? Colors::TabActive : Colors::FrameBg;
+        COLORREF borderColor = isSelected ? Colors::Accent : Colors::Border;
+        COLORREF textColor = Colors::Text;
+
+        if (g_winDriveBtnStates[i].pressed)
+        { bgColor = Colors::AccentPress; borderColor = Colors::Accent; textColor = RGB(255, 255, 255); }
+        else if (g_winDriveBtnStates[i].hovered)
+        { bgColor = Colors::TabHover; borderColor = Colors::Accent; textColor = RGB(255, 255, 255); }
+
+        HBRUSH bgBrush = CreateSolidBrush(bgColor);
+        HPEN bPen = CreatePen(PS_SOLID, 1, borderColor);
+        HBRUSH oldBr = (HBRUSH)SelectObject(hdc, bgBrush);
+        HPEN oldPn = (HPEN)SelectObject(hdc, bPen);
+        RoundRect(hdc, btnRect.left, btnRect.top, btnRect.right, btnRect.bottom, 8, 8);
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPn);
+        DeleteObject(bgBrush);
+        DeleteObject(bPen);
+
+        SetTextColor(hdc, textColor);
+        wchar_t driveText[128];
+        wsprintfW(driveText, L"  %c:  %s  (%s)", g_winDrives[i].letter, g_winDrives[i].label.c_str(), g_winDrives[i].typeStr.c_str());
+        RECT labelRect = btnRect;
+        labelRect.left += 10;
+        SelectObject(hdc, g_buttonFont);
+        DrawText(hdc, driveText, -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        SetTextColor(hdc, Colors::TextDim);
+        std::wstring sizeStr = FormatBytes(g_winDrives[i].totalBytes.QuadPart);
+        std::wstring freeStr = FormatBytes(g_winDrives[i].freeBytes.QuadPart);
+        wchar_t sizeText[64];
+        wsprintfW(sizeText, L"%s free / %s", freeStr.c_str(), sizeStr.c_str());
+        RECT sizeRect = btnRect;
+        sizeRect.right -= 12;
+        SelectObject(hdc, g_smallFont);
+        DrawText(hdc, sizeText, -1, &sizeRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clipRgn);
+
+    // Action buttons at bottom
+    int btnY = clientRect.bottom - 60;
+    int actionBtnW = 180;
+    int actionBtnH = 42;
+    int gap = 14;
+
+    g_winInstallBtnRect.left = contentCenterX - actionBtnW - gap / 2;
+    g_winInstallBtnRect.right = g_winInstallBtnRect.left + actionBtnW;
+    g_winInstallBtnRect.top = btnY;
+    g_winInstallBtnRect.bottom = btnY + actionBtnH;
+    DrawRoundedButton(hdc, g_winInstallBtnRect, L"Install Windows", g_winInstallBtn);
+
+    g_winCopyAllBtnRect.left = contentCenterX + gap / 2;
+    g_winCopyAllBtnRect.right = g_winCopyAllBtnRect.left + actionBtnW;
+    g_winCopyAllBtnRect.top = btnY;
+    g_winCopyAllBtnRect.bottom = btnY + actionBtnH;
+    DrawRoundedButton(hdc, g_winCopyAllBtnRect, L"Copy to All Partitions", g_winCopyAllBtn);
+}
+
+// Run a command and capture its stdout into a wstring (utf-8 decoded best-effort)
+std::wstring RunAndCaptureOutput(const wchar_t* cmd, DWORD timeoutMs = 60000)
+{
+    HANDLE hReadPipe = nullptr, hWritePipe = nullptr;
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0))
+        return L"";
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFO si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi = {};
+    std::wstring cmdStr(cmd);
+    BOOL ok = CreateProcess(nullptr, &cmdStr[0], nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hWritePipe);
+    if (!ok)
+    {
+        CloseHandle(hReadPipe);
+        return L"";
+    }
+
+    std::string out;
+    char buf[512];
+    DWORD bytesRead;
+    while (ReadFile(hReadPipe, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0)
+        out.append(buf, bytesRead);
+
+    WaitForSingleObject(pi.hProcess, timeoutMs);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hReadPipe);
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, out.c_str(), (int)out.size(), nullptr, 0);
+    std::wstring wout(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, out.c_str(), (int)out.size(), &wout[0], wlen);
+    return wout;
+}
+
+std::wstring InstallWindowsToDrive(HWND hwnd, wchar_t targetLetter)
+{
+    // 1. Prompt for ISO file
+    wchar_t isoPath[MAX_PATH] = {};
+    OPENFILENAME ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = isoPath;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"ISO Files (*.iso)\0*.iso\0All Files\0*.*\0";
+    ofn.lpstrTitle = L"Select a Windows ISO";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileName(&ofn))
+        return L"Cancelled.";
+
+    // 2. Snapshot current drive letters
+    DWORD maskBefore = GetLogicalDrives();
+
+    // 3. Mount ISO
+    wchar_t mountCmd[MAX_PATH + 256];
+    _snwprintf_s(mountCmd, _TRUNCATE,
+        L"powershell -NoProfile -WindowStyle Hidden -Command \"Mount-DiskImage -ImagePath '%s' | Out-Null\"",
+        isoPath);
+    RunHiddenCommand(mountCmd, 60000);
+
+    // Give the OS a moment to assign a drive letter
+    Sleep(1500);
+
+    // 4. Find the newly mounted drive letter
+    DWORD maskAfter = GetLogicalDrives();
+    DWORD newMask = maskAfter & ~maskBefore;
+    wchar_t mountedLetter = 0;
+    for (int i = 0; i < 26; i++)
+    {
+        if (newMask & (1 << i)) { mountedLetter = L'A' + i; break; }
+    }
+
+    if (!mountedLetter)
+    {
+        // Attempt to dismount just in case, then bail
+        wchar_t dismount[MAX_PATH + 256];
+        _snwprintf_s(dismount, _TRUNCATE,
+            L"powershell -NoProfile -WindowStyle Hidden -Command \"Dismount-DiskImage -ImagePath '%s' | Out-Null\"",
+            isoPath);
+        RunHiddenCommand(dismount, 60000);
+        return L"Failed to mount the ISO or locate its drive letter.";
+    }
+
+    // 5. Robocopy mounted ISO contents to target drive
+    wchar_t roboCmd[256];
+    _snwprintf_s(roboCmd, _TRUNCATE,
+        L"robocopy %c:\\ %c:\\ /E /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP",
+        mountedLetter, targetLetter);
+    RunHiddenCommand(roboCmd, 3600000); // up to 1 hour
+
+    // 6. Dismount ISO
+    wchar_t dismountCmd[MAX_PATH + 256];
+    _snwprintf_s(dismountCmd, _TRUNCATE,
+        L"powershell -NoProfile -WindowStyle Hidden -Command \"Dismount-DiskImage -ImagePath '%s' | Out-Null\"",
+        isoPath);
+    RunHiddenCommand(dismountCmd, 60000);
+
+    wchar_t msg[128];
+    swprintf_s(msg, 128, L"Copied Windows files to drive %c:", targetLetter);
+    return msg;
+}
+
+std::wstring CopyWindowsToAllPartitions(HWND hwnd, wchar_t sourceLetter)
+{
+    // Find drives whose volume label starts with "ECLYPSE" (excluding the source)
+    DWORD mask = GetLogicalDrives();
+    std::vector<wchar_t> targets;
+    for (int i = 0; i < 26; i++)
+    {
+        if (!(mask & (1 << i))) continue;
+        wchar_t letter = L'A' + i;
+        if (letter == sourceLetter) continue;
+        wchar_t root[] = { letter, L':', L'\\', 0 };
+        UINT dt = GetDriveType(root);
+        if (dt != DRIVE_FIXED && dt != DRIVE_REMOVABLE) continue;
+
+        wchar_t volumeName[MAX_PATH] = {};
+        GetVolumeInformation(root, volumeName, MAX_PATH, nullptr, nullptr, nullptr, nullptr, 0);
+        if (_wcsnicmp(volumeName, L"ECLYPSE", 7) != 0) continue;
+
+        targets.push_back(letter);
+    }
+
+    if (targets.empty())
+    {
+        MessageBox(hwnd,
+            L"No ECLYPSE partitions were found.\n\nOnly drives whose label starts with \"ECLYPSE\" are copied to. Create partitions first from the Cleaner or Partitions tab.",
+            L"ECLYPSE - Windows", MB_OK | MB_ICONINFORMATION);
+        return L"No ECLYPSE partitions found.";
+    }
+
+    for (wchar_t t : targets)
+    {
+        wchar_t roboCmd[256];
+        _snwprintf_s(roboCmd, _TRUNCATE,
+            L"robocopy %c:\\ %c:\\ /E /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP",
+            sourceLetter, t);
+        RunHiddenCommand(roboCmd, 3600000);
+    }
+
+    wchar_t msg[160];
+    swprintf_s(msg, 160, L"Replicated %c: to %d ECLYPSE partition%s.",
+        sourceLetter, (int)targets.size(), targets.size() == 1 ? L"" : L"s");
+    return msg;
+}
+
 void DrawContentPanel(HDC hdc, RECT clientRect)
 {
     if (g_activeTab == TAB_CLEANER)
@@ -2183,6 +2508,15 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
     else if (g_activeTab == TAB_PARTITIONS)
     {
         DrawPartitionsPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_WINDOWS)
+    {
+        if (!g_winDrivesLoaded)
+        {
+            EnumerateWindowsDrives();
+            g_winDrivesLoaded = true;
+        }
+        DrawWindowsPanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_OPTIMIZATION)
     {
@@ -3268,26 +3602,155 @@ std::wstring OptimGpuPriority()
 }
 
 // ============================================================
-// Experimental functions (stubs — fill in)
+// Spoofer driver (SpoofyDrivy.sys) — load/unload/restart
 // ============================================================
 
-std::wstring ExpButton1()
+constexpr const wchar_t* SPOOFER_SERVICE_NAME = L"SpoofyDrivy";
+constexpr const wchar_t* SPOOFER_DISPLAY_NAME = L"SpoofyDrivy Spoofer";
+
+// Locate SpoofyDrivy.sys — try a few candidate paths relative to the exe,
+// then fall back to the original source location.
+std::wstring FindSpooferSysPath()
 {
-    // TODO: implement
-    return L"Succesfully Loaded driver.";
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileName(nullptr, exePath, MAX_PATH);
+    std::wstring exeDir = exePath;
+    size_t lastSlash = exeDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) exeDir.resize(lastSlash);
+
+    std::wstring candidates[] = {
+        exeDir + L"\\SpoofyDrivy.sys",
+        exeDir + L"\\..\\..\\SpoofyDrivy\\build\\Debug\\SpoofyDrivy.sys",
+        exeDir + L"\\..\\..\\SpoofyDrivy\\build\\Release\\SpoofyDrivy.sys",
+        L"C:\\Projects\\driver\\build\\Debug\\SpoofyDrivy.sys",
+        L"C:\\Projects\\driver\\build\\Release\\SpoofyDrivy.sys",
+    };
+
+    for (const auto& c : candidates)
+    {
+        if (GetFileAttributes(c.c_str()) != INVALID_FILE_ATTRIBUTES)
+        {
+            wchar_t full[MAX_PATH];
+            if (GetFullPathName(c.c_str(), MAX_PATH, full, nullptr))
+                return full;
+            return c;
+        }
+    }
+    return L"";
 }
 
-std::wstring ExpButton2()
+std::wstring FormatWinError(DWORD err)
 {
-    // TODO: implement
-    return L"Succesfully Unloaded driver.";
+    wchar_t buf[256] = {};
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err, 0, buf, 256, nullptr);
+    wchar_t out[320];
+    wsprintfW(out, L"error %lu: %s", err, buf);
+    return out;
 }
 
-std::wstring ExpButton3()
+// Register the service if missing. Returns service handle (caller closes), or nullptr with errOut set.
+SC_HANDLE OpenOrCreateSpooferService(SC_HANDLE scm, const std::wstring& sysPath, DWORD& errOut)
 {
-    // TODO: implement
-    return L"Succesfully Restarted the driver.";
+    SC_HANDLE svc = OpenService(scm, SPOOFER_SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (svc) { errOut = 0; return svc; }
+    DWORD openErr = GetLastError();
+    if (openErr != ERROR_SERVICE_DOES_NOT_EXIST) { errOut = openErr; return nullptr; }
+
+    if (sysPath.empty()) { errOut = ERROR_FILE_NOT_FOUND; return nullptr; }
+
+    svc = CreateService(scm, SPOOFER_SERVICE_NAME, SPOOFER_DISPLAY_NAME,
+        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+        sysPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
+    if (!svc) { errOut = GetLastError(); return nullptr; }
+    errOut = 0;
+    return svc;
 }
+
+std::wstring SpooferLoad()
+{
+    std::wstring sysPath = FindSpooferSysPath();
+    if (sysPath.empty())
+        return L"Could not locate SpoofyDrivy.sys.\r\n\r\nExpected near the exe, in SpoofyDrivy\\build\\Debug\\, or in C:\\Projects\\driver\\build\\Debug\\.";
+
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (!scm) return L"OpenSCManager failed: " + FormatWinError(GetLastError());
+
+    DWORD err = 0;
+    SC_HANDLE svc = OpenOrCreateSpooferService(scm, sysPath, err);
+    if (!svc) { CloseServiceHandle(scm); return L"Service registration failed: " + FormatWinError(err); }
+
+    std::wstring result;
+    if (StartService(svc, 0, nullptr))
+    {
+        result = L"Driver loaded successfully.\r\n\r\nPath: " + sysPath;
+    }
+    else
+    {
+        DWORD startErr = GetLastError();
+        if (startErr == ERROR_SERVICE_ALREADY_RUNNING)
+            result = L"Driver is already running.\r\n\r\nPath: " + sysPath;
+        else
+            result = L"StartService failed: " + FormatWinError(startErr) +
+                     L"\r\n\r\nIf this is an unsigned driver, Windows must be in test-signing mode (bcdedit /set testsigning on, then reboot).";
+    }
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return result;
+}
+
+std::wstring SpooferUnload()
+{
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (!scm) return L"OpenSCManager failed: " + FormatWinError(GetLastError());
+
+    SC_HANDLE svc = OpenService(scm, SPOOFER_SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (!svc)
+    {
+        DWORD err = GetLastError();
+        CloseServiceHandle(scm);
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST)
+            return L"Driver is not registered (nothing to unload).";
+        return L"OpenService failed: " + FormatWinError(err);
+    }
+
+    std::wstring result;
+    SERVICE_STATUS status = {};
+    if (ControlService(svc, SERVICE_CONTROL_STOP, &status))
+    {
+        result = L"Driver stopped. ";
+    }
+    else
+    {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_NOT_ACTIVE)
+            result = L"Driver was not running. ";
+        else
+            result = L"ControlService(STOP) failed: " + FormatWinError(err) +
+                     L"\r\n(SpoofyDrivy has no DriverUnload routine — delete the service instead.)\r\n";
+    }
+
+    if (DeleteService(svc))
+        result += L"Service deleted.";
+    else
+        result += L"DeleteService failed: " + FormatWinError(GetLastError());
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return result;
+}
+
+std::wstring SpooferRestart()
+{
+    std::wstring stopResult = SpooferUnload();
+    std::wstring startResult = SpooferLoad();
+    return L"Unload step:\r\n" + stopResult + L"\r\n\r\nLoad step:\r\n" + startResult;
+}
+
+std::wstring ExpButton1() { return SpooferLoad(); }
+std::wstring ExpButton2() { return SpooferUnload(); }
+std::wstring ExpButton3() { return SpooferRestart(); }
 
 // ============================================================
 // Disk functions
@@ -4243,6 +4706,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     InvalidateRect(hwnd, &g_mergeBtnRect, FALSE);
             }
         }
+        else if (g_activeTab == TAB_WINDOWS)
+        {
+            for (size_t i = 0; i < g_winDrives.size(); i++)
+            {
+                bool wasHov = g_winDriveBtnStates[i].hovered;
+                g_winDriveBtnStates[i].hovered = PtInRect(&g_winDriveBtnRects[i], pt);
+                if (wasHov != g_winDriveBtnStates[i].hovered)
+                    InvalidateRect(hwnd, &g_winDriveBtnRects[i], FALSE);
+            }
+            bool wi = g_winInstallBtn.hovered;
+            g_winInstallBtn.hovered = PtInRect(&g_winInstallBtnRect, pt);
+            if (wi != g_winInstallBtn.hovered)
+                InvalidateRect(hwnd, &g_winInstallBtnRect, FALSE);
+            bool wc = g_winCopyAllBtn.hovered;
+            g_winCopyAllBtn.hovered = PtInRect(&g_winCopyAllBtnRect, pt);
+            if (wc != g_winCopyAllBtn.hovered)
+                InvalidateRect(hwnd, &g_winCopyAllBtnRect, FALSE);
+        }
 
         if (g_activeTab == TAB_RESTORE)
         {
@@ -4412,6 +4893,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         g_uninstallBtn.hovered = false;
         g_uninstallAllBtn.hovered = false;
         g_uninstallRefreshBtn.hovered = false;
+        // Windows
+        for (auto& s : g_winDriveBtnStates) s.hovered = false;
+        g_winInstallBtn.hovered = false;
+        g_winCopyAllBtn.hovered = false;
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -4438,10 +4923,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 g_debloaterScrollY = 0;
                 g_sysInfoScrollY = 0;
                 g_uninstallScrollY = 0;
+                g_winScrollY = 0;
                 if (i == TAB_CLEANER)
                 {
                     EnumerateDrives();
                     g_drivesLoaded = true;
+                }
+                else if (i == TAB_WINDOWS)
+                {
+                    EnumerateWindowsDrives();
+                    g_winDrivesLoaded = true;
+                    g_winSelectedDrive = -1;
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -4507,6 +4999,33 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     InvalidateRect(hwnd, &g_mergeBtnRect, FALSE);
                     return 0;
                 }
+            }
+        }
+        else if (g_activeTab == TAB_WINDOWS)
+        {
+            for (size_t i = 0; i < g_winDrives.size(); i++)
+            {
+                if (PtInRect(&g_winDriveBtnRects[i], pt))
+                {
+                    g_winDriveBtnStates[i].pressed = true;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g_winDriveBtnRects[i], FALSE);
+                    return 0;
+                }
+            }
+            if (PtInRect(&g_winInstallBtnRect, pt))
+            {
+                g_winInstallBtn.pressed = true;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_winInstallBtnRect, FALSE);
+                return 0;
+            }
+            if (PtInRect(&g_winCopyAllBtnRect, pt))
+            {
+                g_winCopyAllBtn.pressed = true;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_winCopyAllBtnRect, FALSE);
+                return 0;
             }
         }
 
@@ -5289,6 +5808,78 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             InvalidateRect(hwnd, nullptr, FALSE);
         }
 
+        // Windows tab
+        if (g_activeTab == TAB_WINDOWS)
+        {
+            for (size_t i = 0; i < g_winDrives.size(); i++)
+            {
+                bool was = g_winDriveBtnStates[i].pressed;
+                g_winDriveBtnStates[i].pressed = false;
+                if (was && PtInRect(&g_winDriveBtnRects[i], pt))
+                {
+                    g_winSelectedDrive = (int)i;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            bool wasInstall = g_winInstallBtn.pressed; g_winInstallBtn.pressed = false;
+            if (wasInstall && PtInRect(&g_winInstallBtnRect, pt))
+            {
+                if (g_winSelectedDrive < 0 || g_winSelectedDrive >= (int)g_winDrives.size())
+                {
+                    MessageBox(hwnd, L"Please select a target drive first.", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                else
+                {
+                    wchar_t targetLetter = g_winDrives[g_winSelectedDrive].letter;
+                    wchar_t confirmMsg[512];
+                    _snwprintf_s(confirmMsg, _TRUNCATE,
+                        L"Install Windows to drive %c:?\n\n"
+                        L"You will be asked to select a Windows ISO. Its contents will be copied to %c:.\n\n"
+                        L"WARNING: this may take a long time. On mid to low-end systems the computer will slow down while the copy runs.",
+                        targetLetter, targetLetter);
+                    int r = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                    if (r == IDYES)
+                    {
+                        std::wstring res = InstallWindowsToDrive(hwnd, targetLetter);
+                        MessageBox(hwnd, res.c_str(), L"ECLYPSE - Windows", MB_OK | MB_ICONINFORMATION);
+                        EnumerateWindowsDrives();
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
+            bool wasCopy = g_winCopyAllBtn.pressed; g_winCopyAllBtn.pressed = false;
+            if (wasCopy && PtInRect(&g_winCopyAllBtnRect, pt))
+            {
+                if (g_winSelectedDrive < 0 || g_winSelectedDrive >= (int)g_winDrives.size())
+                {
+                    MessageBox(hwnd, L"Please select the source drive first (the one with Windows already installed).", L"ECLYPSE", MB_OK | MB_ICONINFORMATION);
+                }
+                else
+                {
+                    wchar_t sourceLetter = g_winDrives[g_winSelectedDrive].letter;
+                    wchar_t confirmMsg[512];
+                    _snwprintf_s(confirmMsg, _TRUNCATE,
+                        L"Copy the contents of drive %c: to every other ECLYPSE partition?\n\n"
+                        L"Only drives whose label starts with \"ECLYPSE\" will be copied to.\n\n"
+                        L"WARNING: this may take a long time. On mid to low-end systems the computer will slow down while the copy runs.",
+                        sourceLetter);
+                    int r = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Confirm", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                    if (r == IDYES)
+                    {
+                        std::wstring res = CopyWindowsToAllPartitions(hwnd, sourceLetter);
+                        MessageBox(hwnd, res.c_str(), L"ECLYPSE - Windows", MB_OK | MB_ICONINFORMATION);
+                        EnumerateWindowsDrives();
+                    }
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        }
+
         // Action button release (Cleaner tab)
         {
             bool wasPressed = g_actionBtn.pressed;
@@ -5338,6 +5929,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (maxScroll < 0) maxScroll = 0;
             if (g_partScrollY < 0) g_partScrollY = 0;
             if (g_partScrollY > maxScroll) g_partScrollY = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_activeTab == TAB_WINDOWS)
+        {
+            g_winScrollY -= (delta > 0) ? scrollAmount : -scrollAmount;
+            int maxScroll = (int)g_winDrives.size() * 50 - 200;
+            if (maxScroll < 0) maxScroll = 0;
+            if (g_winScrollY < 0) g_winScrollY = 0;
+            if (g_winScrollY > maxScroll) g_winScrollY = maxScroll;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         else if (g_activeTab == TAB_STARTUP)
