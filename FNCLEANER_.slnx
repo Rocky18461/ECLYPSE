@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="FNCLEANER_.vcxproj" />
+  <Project Path="FNCLEANER_.vcxproj" Id="c4c6793d-cb0e-47a1-9bce-60dc232d1789" />
 </Solution>

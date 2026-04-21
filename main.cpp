@@ -41,6 +41,7 @@ struct ButtonState
 enum Tab
 {
     TAB_CLEANER,
+    TAB_SPOOFER,
     TAB_PARTITIONS,
     TAB_OPTIMIZATION,
     TAB_RESTORE,
@@ -54,6 +55,7 @@ enum Tab
 
 static const wchar_t* g_tabNames[TAB_COUNT] = {
     L"Cleaner",
+	L"Spoofer",
     L"Partitions",
     L"Optimization",
     L"Restore",
@@ -110,6 +112,27 @@ static const wchar_t* g_optimDescs[OPTIM_COUNT] = {
     L"Disable fullscreen optimizations system-wide",
     L"Flush standby memory to free up RAM",
     L"Set GPU scheduling to high priority"
+};
+
+// Spoofer tab options
+enum SpooferOption
+{
+    SPOOFER_BUTTON_1,
+    SPOOFER_BUTTON_2,
+    SPOOFER_BUTTON_3,
+    SPOOFER_COUNT
+};
+
+static const wchar_t* g_spooferNames[SPOOFER_COUNT] = {
+    L"Load driver",
+    L"Unload driver",
+    L"Restart driver"
+};
+
+static const wchar_t* g_spooferDesc[SPOOFER_COUNT] = {
+    L"Load the driver into the system",
+    L"Removes the Loaded driver from the system",
+    L"Unloads and Reloads the driver"
 };
 
 // Others tab options
@@ -198,6 +221,10 @@ static RECT g_optionBtnRects[OPT_COUNT];
 // Optimization tab state
 static ButtonState g_optimBtns[OPTIM_COUNT];
 static RECT g_optimBtnRects[OPTIM_COUNT];
+
+// Experimental tab state
+static ButtonState g_expTabBtns[SPOOFER_COUNT];
+static RECT g_expTabBtnRects[SPOOFER_COUNT];
 
 // Restore tab state
 static ButtonState g_restoreCreateBtn;
@@ -1150,6 +1177,56 @@ void DrawDriveSelectPanel(HDC hdc, RECT clientRect)
     SelectObject(hdc, oldFont);
 }
 
+void DrawExperimentalPanel(HDC hdc, RECT clientRect)
+{
+    int contentLeft = SIDEBAR_WIDTH + 30;
+    int contentRight = clientRect.right - 30;
+    int contentCenterX = (contentLeft + contentRight) / 2;
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    SetTextColor(hdc, Colors::Text);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_titleFont);
+    RECT headerRect = { contentLeft, 25, contentRight, 55 };
+    DrawText(hdc, L"Spoofer", -1, &headerRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    HPEN sepPen = CreatePen(PS_SOLID, 1, Colors::Border);
+    HPEN oldPen = (HPEN)SelectObject(hdc, sepPen);
+    MoveToEx(hdc, contentLeft, 65, nullptr);
+    LineTo(hdc, contentRight, 65);
+    SelectObject(hdc, oldPen);
+    DeleteObject(sepPen);
+
+    SetTextColor(hdc, Colors::TextDim);
+    SelectObject(hdc, g_descFont);
+    RECT descRect = { contentLeft, 75, contentRight, 100 };
+    DrawText(hdc, L"Load the driver to spoof, may take a while.", -1, &descRect, DT_LEFT | DT_WORDBREAK);
+
+    int btnWidth = 260;
+    int btnHeight = 44;
+    int spacing = 12;
+    int startY = 120;
+
+    for (int i = 0; i < SPOOFER_COUNT; i++)
+    {
+        RECT btnRect;
+        btnRect.left = contentCenterX - btnWidth / 2;
+        btnRect.right = btnRect.left + btnWidth;
+        btnRect.top = startY + i * (btnHeight + spacing + 20);
+        btnRect.bottom = btnRect.top + btnHeight;
+        g_expTabBtnRects[i] = btnRect;
+
+        DrawRoundedButton(hdc, btnRect, g_spooferNames[i], g_expTabBtns[i]);
+
+        SetTextColor(hdc, Colors::TextDim);
+        SelectObject(hdc, g_smallFont);
+        RECT optDesc = { contentLeft, btnRect.bottom + 4, contentRight, btnRect.bottom + 22 };
+        DrawText(hdc, g_spooferDesc[i], -1, &optDesc, DT_CENTER | DT_SINGLELINE);
+    }
+
+    SelectObject(hdc, oldFont);
+}
+
 void DrawOptimizationPanel(HDC hdc, RECT clientRect)
 {
     int contentLeft = SIDEBAR_WIDTH + 30;
@@ -2098,6 +2175,10 @@ void DrawContentPanel(HDC hdc, RECT clientRect)
             g_drivesLoaded = true;
         }
         DrawDriveSelectPanel(hdc, clientRect);
+    }
+    else if (g_activeTab == TAB_SPOOFER)
+    {
+        DrawExperimentalPanel(hdc, clientRect);
     }
     else if (g_activeTab == TAB_PARTITIONS)
     {
@@ -3187,6 +3268,28 @@ std::wstring OptimGpuPriority()
 }
 
 // ============================================================
+// Experimental functions (stubs — fill in)
+// ============================================================
+
+std::wstring ExpButton1()
+{
+    // TODO: implement
+    return L"Succesfully Loaded driver.";
+}
+
+std::wstring ExpButton2()
+{
+    // TODO: implement
+    return L"Succesfully Unloaded driver.";
+}
+
+std::wstring ExpButton3()
+{
+    // TODO: implement
+    return L"Succesfully Restarted the driver.";
+}
+
+// ============================================================
 // Disk functions
 // ============================================================
 // ============================================================
@@ -4100,6 +4203,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             if (wasExp != g_experimentalBtn.hovered)
                 InvalidateRect(hwnd, &g_experimentalBtnRect, FALSE);
         }
+        else if (g_activeTab == TAB_SPOOFER)
+        {
+            for (int i = 0; i < SPOOFER_COUNT; i++)
+            {
+                bool wasHov = g_expTabBtns[i].hovered;
+                g_expTabBtns[i].hovered = PtInRect(&g_expTabBtnRects[i], pt);
+                if (wasHov != g_expTabBtns[i].hovered)
+                    InvalidateRect(hwnd, &g_expTabBtnRects[i], FALSE);
+            }
+        }
         else if (g_activeTab == TAB_PARTITIONS)
         {
             if (g_partShowDriveSelect)
@@ -4271,6 +4384,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             s.hovered = false;
         for (auto& s : g_optimBtns)
             s.hovered = false;
+        for (auto& s : g_expTabBtns)
+            s.hovered = false;
         g_restoreCreateBtn.hovered = false;
         g_restoreLoadBtn.hovered = false;
         g_restoreApplyBtn.hovered = false;
@@ -4426,6 +4541,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     g_optimBtns[i].pressed = true;
                     SetCapture(hwnd);
                     InvalidateRect(hwnd, &g_optimBtnRects[i], FALSE);
+                    return 0;
+                }
+            }
+        }
+        else if (g_activeTab == TAB_SPOOFER)
+        {
+            for (int i = 0; i < SPOOFER_COUNT; i++)
+            {
+                if (PtInRect(&g_expTabBtnRects[i], pt))
+                {
+                    g_expTabBtns[i].pressed = true;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g_expTabBtnRects[i], FALSE);
                     return 0;
                 }
             }
@@ -4748,6 +4876,38 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 }
 
                 InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+
+        // Experimental tab buttons
+        if (g_activeTab == TAB_SPOOFER)
+        {
+            for (int i = 0; i < SPOOFER_COUNT; i++)
+            {
+                bool wasPressed = g_expTabBtns[i].pressed;
+                g_expTabBtns[i].pressed = false;
+
+                if (wasPressed && PtInRect(&g_expTabBtnRects[i], pt))
+                {
+                    wchar_t confirmMsg[256];
+                    wsprintfW(confirmMsg, L"Run experimental action: %s?\n\n%s", g_spooferNames[i], g_spooferDesc[i]);
+                    int result = MessageBox(hwnd, confirmMsg, L"ECLYPSE - Experimental", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+
+                    if (result == IDYES)
+                    {
+                        std::wstring resultStr;
+                        switch (i)
+                        {
+                        case SPOOFER_BUTTON_1: resultStr = ExpButton1(); break;
+                        case SPOOFER_BUTTON_2: resultStr = ExpButton2(); break;
+                        case SPOOFER_BUTTON_3: resultStr = ExpButton3(); break;
+                        }
+                        MessageBox(hwnd, resultStr.c_str(), L"ECLYPSE - Experimental", MB_OK | MB_ICONINFORMATION);
+                    }
+
+                    InvalidateRect(hwnd, &g_expTabBtnRects[i], FALSE);
+                    return 0;
+                }
             }
         }
 
